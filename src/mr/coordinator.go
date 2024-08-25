@@ -90,7 +90,7 @@ func (c *Coordinator) ReportMapResult(req *ReportMapJobRequest, resp *EmptyRespo
 	return nil
 }
 
-func (c *Coordinator) ReportReduceResult(req *ReportReduceJobResult, resp *EmptyResponse) {
+func (c *Coordinator) ReportReduceResult(req *ReportReduceJobResult, resp *EmptyResponse) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.reduceJobStatus[req.ReduceNumber] = "completed"
