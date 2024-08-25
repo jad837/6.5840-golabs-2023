@@ -86,7 +86,7 @@ func DoMapping(job *MapJob, mapf func(string, string) []KeyValue) {
 	}
 
 	//TODO report that this is done
-
+	ReportMapResult(MapResult{InputFile: filename, IntermediateFile: intermediateFiles, Pid: os.Getpid()})
 }
 
 func DoReducing(job *ReduceJob, reducef func(string, []string) string) {
@@ -138,6 +138,7 @@ func DoReducing(job *ReduceJob, reducef func(string, []string) string) {
 	os.Rename(tempFile.Name(), ofname)
 
 	// TODO report this shit is done
+	ReportReduceResult(ReduceResult{Pid: os.Getpid(), ReducerCount: job.ReducerCount})
 }
 
 // example function to show how to make an RPC call to the coordinator.

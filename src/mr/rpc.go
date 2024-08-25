@@ -40,6 +40,11 @@ type ReportMapJobRequest struct {
 	Pid              int
 }
 
+type ReportReduceJobResult struct {
+	Pid          int
+	ReduceNumber int
+}
+
 type MapResult struct {
 	InputFile        string
 	IntermediateFile []string

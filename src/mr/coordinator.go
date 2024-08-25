@@ -80,6 +80,23 @@ func (c *Coordinator) GetMapJob() *MapJob {
 	return nil
 }
 
+func (c *Coordinator) ReportMapResult(req *ReportMapJobRequest, resp *EmptyResponse) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.mapJobStatus[req.InputFile] = "completed"
+	for r := 0; r < c.nReducer; r++ {
+		c.intermediateFiles[r] = append(c.intermediateFiles[r], req.IntermediateFile[r])
+	}
+	return nil
+}
+
+func (c *Coordinator) ReportReduceResult(req *ReportReduceJobResult, resp *EmptyResponse) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reduceJobStatus[req.ReduceNumber] = "completed"
+	return nil
+}
+
 // an example RPC handler.
 //
 // the RPC argument and reply types are defined in rpc.go.
