@@ -13,8 +13,8 @@ This repository contains the solutions for the labs in the MIT 6.5840 Distribute
 
 1. Clone this repository:
    ```bash
-   git clone https://github.com/your-username/your-repo.git
-   cd your-repo
+   git clone https://github.com/jad837/6.5840-golabs-2023 6.5840
+   cd 6.5840
 2. Install dependencies 
     ```bash 
     go mod tidy
