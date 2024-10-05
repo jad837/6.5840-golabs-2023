@@ -14,18 +14,18 @@ import (
 // example to show how to declare the arguments
 // and reply for an RPC.
 type MapJob struct {
-	InputFile    string
-	MapJobNumber int
-	ReducerCount int
+	InputFile         string
+	ReducerCount      int
+	IntermediateFiles []string
 }
 
 type ReduceJob struct {
-	IntermediateFiles []string
-	ReducerCount      int
+	ReducerNumber     int
+	IntermediateFiles []string // locations of the intermediate files
 }
 
 type GetJobRequest struct {
-	Pid int
+	WorkerId int
 }
 
 type GetJobResponse struct {
@@ -34,25 +34,14 @@ type GetJobResponse struct {
 	IsFinished bool
 }
 
-type ReportMapJobRequest struct {
-	InputFile        string
-	IntermediateFile []string
-	Pid              int
-}
-
-type ReportReduceJobResult struct {
-	Pid          int
-	ReduceNumber int
-}
-
 type MapResult struct {
 	InputFile        string
 	IntermediateFile []string
-	Pid              int
+	WorkerId         int
 }
 
 type ReduceResult struct {
-	Pid          int
+	WorkerId     int
 	ReducerCount int
 }
 

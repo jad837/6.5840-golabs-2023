@@ -36,7 +36,23 @@ func ihash(key string) int {
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue,
 	reducef func(string, []string) string) {
+	isDone := false
+	for !isDone {
+		resp := GetJob()
+		if resp.IsFinished {
+			isDone = true
+			log.Printf("Done with this, bye bye")
+			continue
+		}
 
+		if resp.MapJob != nil {
+			DoMapping(resp.MapJob, mapf)
+		}
+
+		if resp.ReduceJob != nil {
+			DoReducing(resp.ReduceJob, reducef)
+		}
+	}
 	// Your worker implementation here.
 
 	// uncomment to send the Example RPC to the coordinator.
@@ -45,6 +61,7 @@ func Worker(mapf func(string, string) []KeyValue,
 }
 
 func DoMapping(job *MapJob, mapf func(string, string) []KeyValue) {
+
 	// open and get content from file and use mapf as shown in mrsequential.go
 	filename := job.InputFile
 	file, err := os.Open(filename)
@@ -57,11 +74,20 @@ func DoMapping(job *MapJob, mapf func(string, string) []KeyValue) {
 		log.Fatalf("error reading file %s", filename)
 	}
 	file.Close()
+
 	kva := mapf(filename, string(content))
 	sort.Sort(ByKey(kva))
 
 	// slice the kva, and use ihash to partition the output.
-
+	// open each partitioned file and then write to the file... but wont this make the file appending risky in case of appending to same files?
+	// to avoid the writing to same file at the same time by multiple different threads
+	// 1. map job -> R files -> add shuffle/collect and create reduce-tmp file stage in reduction jobs.
+	// 2. write through a common method with locks.
+	// i think we should go with method 1? if method 1 is done following will be true. also this is true in sense of acting as node instead of thread.
+	// 1. you can run a collect/shuffle job and collect all the data by "completed" map job. & then this map file should never be processed. (call this stage as finished.)
+	// 2. you will need to give each worker its own directory so it will write to this directory & then be done with everything? But then before starting reduction the
+	// state of all the mapjobs should be finished/shuffled.
+	// with method 2 upside is that at least for this scope it will be easier to process & write to the files as I am working in multithread and not multi node system.
 	partitionedKva := make([][]KeyValue, job.ReducerCount)
 
 	for _, v := range kva {
@@ -71,14 +97,15 @@ func DoMapping(job *MapJob, mapf func(string, string) []KeyValue) {
 
 	intermediateFiles := make([]string, job.ReducerCount)
 	for i := 0; i < job.ReducerCount; i++ {
-		// 	oname := "mr-out-0"
-		intermediateFile := fmt.Sprintf("mr-%v-%v", job.MapJobNumber, i)
+		// 	oname := "mr-{mapjobfilename}-0"
+		// always check if similar file is already there, it is truncated and then rewritten so no worries about using the filename.
+		intermediateFile := fmt.Sprintf("mr-%v-%v", job.InputFile, i)
 		intermediateFiles[i] = intermediateFile
 		oFile, _ := os.Create(intermediateFile)
 
 		b, err := json.Marshal(partitionedKva[i])
 		if err != nil {
-			fmt.Printf("JSON error", err)
+			log.Printf("JSON error", err)
 		}
 
 		oFile.Write(b)
@@ -86,7 +113,7 @@ func DoMapping(job *MapJob, mapf func(string, string) []KeyValue) {
 	}
 
 	//TODO report that this is done
-	ReportMapResult(MapResult{InputFile: filename, IntermediateFile: intermediateFiles, Pid: os.Getpid()})
+	ReportMapResult(MapResult{InputFile: filename, IntermediateFile: intermediateFiles, WorkerId: os.Getpid()})
 }
 
 func DoReducing(job *ReduceJob, reducef func(string, []string) string) {
@@ -95,23 +122,22 @@ func DoReducing(job *ReduceJob, reducef func(string, []string) string) {
 	for _, file := range job.IntermediateFiles {
 		dat, err := ioutil.ReadFile(file)
 		if err != nil {
-			fmt.Println("Read Error: ", err.Error())
+			log.Println("Read Error: ", err.Error())
 		}
 		var kva []KeyValue
 		err = json.Unmarshal(dat, &kva)
 		if err != nil {
-			fmt.Println("Unmarshalling error: ", err.Error())
+			log.Println("Unmarshalling error: ", err.Error())
 		}
 
 		intermediate = append(intermediate, kva...)
 	}
 
 	sort.Sort(ByKey(intermediate))
-
-	ofname := fmt.Sprintf("mr-out-%v", job.ReducerCount)
+	ofname := fmt.Sprintf("mr-out-%v", job.ReducerNumber)
 	tempFile, err := ioutil.TempFile(".", ofname)
 	if err != nil {
-		fmt.Println("error creating temp file")
+		log.Println("error creating temp file")
 	}
 	//
 	// call Reduce on each distinct key in intermediate[],
@@ -138,7 +164,7 @@ func DoReducing(job *ReduceJob, reducef func(string, []string) string) {
 	os.Rename(tempFile.Name(), ofname)
 
 	// TODO report this shit is done
-	ReportReduceResult(ReduceResult{Pid: os.Getpid(), ReducerCount: job.ReducerCount})
+	ReportReduceResult(ReduceResult{WorkerId: os.Getpid(), ReducerCount: job.ReducerNumber})
 }
 
 // example function to show how to make an RPC call to the coordinator.
@@ -147,7 +173,7 @@ func DoReducing(job *ReduceJob, reducef func(string, []string) string) {
 
 func GetJob() GetJobResponse {
 	req := GetJobRequest{}
-	req.Pid = os.Getpid()
+	req.WorkerId = os.Getpid()
 
 	resp := GetJobResponse{}
 
@@ -207,7 +233,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 	if err == nil {
 		return true
 	}
-
 	fmt.Println(err)
 	return false
 }
