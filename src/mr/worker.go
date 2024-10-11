@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"path/filepath"
 	"sort"
+	"strings"
 )
 
 // Map functions return a slice of KeyValue.
@@ -96,10 +98,13 @@ func DoMapping(job *MapJob, mapf func(string, string) []KeyValue) {
 	}
 
 	intermediateFiles := make([]string, job.ReducerCount)
+	inputFilename := filepath.Base(job.InputFile)
+	inputFilename = strings.Split(inputFilename, ".")[0]
+
 	for i := 0; i < job.ReducerCount; i++ {
 		// 	oname := "mr-{mapjobfilename}-0"
 		// always check if similar file is already there, it is truncated and then rewritten so no worries about using the filename.
-		intermediateFile := fmt.Sprintf("mr-%v-%v", job.InputFile, i)
+		intermediateFile := fmt.Sprintf("mr-%v-%v.txt", inputFilename, i)
 		intermediateFiles[i] = intermediateFile
 		oFile, _ := os.Create(intermediateFile)
 
@@ -162,7 +167,6 @@ func DoReducing(job *ReduceJob, reducef func(string, []string) string) {
 	}
 
 	os.Rename(tempFile.Name(), ofname)
-
 	// TODO report this shit is done
 	ReportReduceResult(ReduceResult{WorkerId: os.Getpid(), ReducerCount: job.ReducerNumber})
 }

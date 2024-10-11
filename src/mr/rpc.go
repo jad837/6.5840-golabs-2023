@@ -48,6 +48,23 @@ type ReduceResult struct {
 type EmptyResponse struct {
 }
 
+type RegisterWorker struct {
+	WorkerId int
+}
+
+type RegisterWorkerResponse struct {
+	WorkerId   int
+	AssignedId int
+}
+
+type WorkerHealth struct {
+	WorkerId string
+}
+
+type WorkerHealthResponse struct {
+	Status string
+}
+
 type ExampleArgs struct {
 	X int
 }
