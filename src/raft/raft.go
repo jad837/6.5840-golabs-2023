@@ -165,10 +165,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	reply.VoteGranted = false
+	reply.Term = rf.currentTerm
 	DPrintf("request vote data for %d, term %d, req term %d", rf.me, rf.currentTerm, args.Term)
 	if args.Term < rf.currentTerm {
-		reply.VoteGranted = false
 		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.state = 0
+		rf.votedFor = -1
+		rf.currentTerm = args.Term
 	}
 
 	if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
@@ -181,11 +188,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		DPrintf("args.lastLogTerm %d argsLastLogIndex %d, voter %d, voterLastIndex : %d, voterLastTerm :%d", args.LastLogTerm, args.LastLogIndex, rf.me, lastIndex, lastTerm)
 		if args.LastLogTerm >= lastTerm && lastIndex <= args.LastLogIndex {
 			reply.VoteGranted = true
+			rf.votedFor = args.CandidateId
 		}
 	} else {
 		reply.VoteGranted = false
 	}
-	reply.Term = rf.currentTerm
 	DPrintf("Vote data candidate %d voter %d, vote grant %v", args.CandidateId, rf.me, reply.VoteGranted)
 
 }
@@ -252,20 +259,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	DPrintf("appendEntries args.Term %d, rf.currentTerm %d", args.Term, rf.currentTerm)
+	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
-		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
 
 	if args.Entries == nil {
 		// considering as heartbeat, reset timer for heartbeats
+		DPrintf("server %d accepted appendEntries (HeartBeat) from %d", rf.me, args.LeaderId)
 		rf.ResetElectionTimer()
-		reply.Term = rf.currentTerm
+		rf.state = 0
+		rf.currentTerm = args.Term
 		reply.Success = true
 		return
 	}
-
+	DPrintf("appendentries with some log entries?????")
 	// log entry check, for request prevlogindex and current logs index
 	// need to traverse log in reverse to find prevLogIndex entry or prevLogIndex entry isn't present
 	for i := len(rf.log) - 1; i >= 0; i-- {
@@ -309,6 +318,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, rf.log[len(rf.log)-1].Index)
 	}
+	rf.ResetElectionTimer()
+	rf.currentTerm = args.Term
 	reply.Term = rf.currentTerm
 	reply.Success = true
 
@@ -332,8 +343,11 @@ func compareLogEntries(index1 int, index2 int, log1 []LogEntry, log2 []LogEntry)
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	DPrintf("Leader %d sending append entry to %d", rf.me, server)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	if reply.Term > rf.currentTerm {
+		ok = false
+	}
+	DPrintf("Leader %d sending append entry to %d, reply is %v", rf.me, server, ok)
 	return ok
 }
 
@@ -362,11 +376,13 @@ func (rf *Raft) sendAppendEntries(sendLogs bool) {
 		}
 		rf.mu.Unlock()
 		for server, _ := range rf.peers {
-			if server != rf.me {
-				DPrintf("sending append entries to %d from %d", server, rf.me)
+			go func(peerId int) {
+				if peerId == rf.me {
+					return
+				}
 				reply := AppendEntriesReply{}
-				go rf.sendAppendEntry(server, &args, &reply)
-			}
+				rf.sendAppendEntry(server, &args, &reply)
+			}(server)
 		}
 	}
 
@@ -406,6 +422,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	rf.electionTimeout.Stop()
 }
 
@@ -417,7 +436,6 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) conductVoting() {
 	DPrintf("Conducting voting from %d", rf.me)
 	rf.mu.Lock()
-	rf.ResetElectionTimer()
 	if rf.state == 2 {
 		// you are leader dont need to do election here
 		DPrintf("Leader %d conducting voting so abandoning", rf.me)
@@ -426,11 +444,8 @@ func (rf *Raft) conductVoting() {
 	}
 	rf.state = 1
 	rf.currentTerm++
+	rf.ResetElectionTimer()
 	rf.votedFor = rf.me
-
-	voteReceived := 1
-	voteGranted := 1
-	voteResultChan := make(chan bool)
 	lastLogTerm := 0
 	lastLogIndex := 0
 
@@ -448,6 +463,10 @@ func (rf *Raft) conductVoting() {
 
 	rf.mu.Unlock()
 
+	voteReceived := 1
+	voteGranted := 1
+	voteResultChan := make(chan bool)
+
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
 			continue
@@ -464,6 +483,7 @@ func (rf *Raft) conductVoting() {
 			}
 		}(peer)
 	}
+
 	// calculate results
 	DPrintf("calculating results for candidate %d", rf.me)
 	for {
@@ -481,20 +501,18 @@ func (rf *Raft) conductVoting() {
 	}
 
 	rf.mu.Lock()
-	if rf.state != 1 {
-		DPrintf("candidate %d state changed before electing it leader", rf.me)
-		rf.mu.Unlock()
-		return
-	}
-	rf.mu.Unlock()
-
-	if voteGranted > len(rf.peers)/2 {
-		rf.mu.Lock()
+	if rf.state == 1 && voteGranted > len(rf.peers)/2 {
 		rf.state = 2
 		rf.ResetElectionTimer()
 		rf.mu.Unlock()
 		DPrintf("New elected leader %d, for term %d sending out entries ", rf.me, rf.currentTerm)
 		rf.sendAppendEntries(false)
+	} else if rf.state != 1 {
+		rf.mu.Unlock()
+		DPrintf("Candidate %d state changed  election setting abandoned", rf.me)
+	} else {
+		rf.mu.Unlock()
+		DPrintf("Not enough votes received for candidate %d", rf.me)
 	}
 }
 
@@ -507,7 +525,6 @@ func (rf *Raft) ticker() {
 		case <-rf.heartbeatTicker.C:
 			DPrintf("Heartbeat ticked for server %d ", rf.me)
 			rf.sendAppendEntries(false)
-
 		}
 
 		// Your code here (2A)
@@ -540,7 +557,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = 0
 	rf.votedFor = -1
 	rf.currentTerm = 1
-	rf.electionTimeout = time.NewTimer(time.Duration(50+rand.Int31n(150)) * time.Millisecond)
+	rf.electionTimeout = time.NewTimer(time.Duration(300+rand.Int31n(150)) * time.Millisecond)
 	rf.heartbeatTicker = time.NewTicker(100 * time.Millisecond)
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
