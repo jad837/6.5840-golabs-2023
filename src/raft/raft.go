@@ -49,7 +49,7 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 type LogEntry struct {
-	Command string
+	Command interface{}
 	Term    int
 	Index   int
 }
@@ -167,7 +167,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	reply.VoteGranted = false
 	reply.Term = rf.currentTerm
-	DPrintf("request vote data for %d, term %d, req term %d", rf.me, rf.currentTerm, args.Term)
+	DPrintf(dVote, "request vote data for %d, term %d, req term %d", rf.me, rf.currentTerm, args.Term)
 	if args.Term < rf.currentTerm {
 		return
 	}
@@ -185,7 +185,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			lastTerm = rf.log[len(rf.log)-1].Term
 			lastIndex = rf.log[len(rf.log)-1].Index
 		}
-		DPrintf("args.lastLogTerm %d argsLastLogIndex %d, voter %d, voterLastIndex : %d, voterLastTerm :%d", args.LastLogTerm, args.LastLogIndex, rf.me, lastIndex, lastTerm)
+		DPrintf(dVote, "args.lastLogTerm %d argsLastLogIndex %d, voter %d, voterLastIndex : %d, voterLastTerm :%d", args.LastLogTerm, args.LastLogIndex, rf.me, lastIndex, lastTerm)
 		if args.LastLogTerm >= lastTerm && lastIndex <= args.LastLogIndex {
 			reply.VoteGranted = true
 			rf.votedFor = args.CandidateId
@@ -193,7 +193,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	} else {
 		reply.VoteGranted = false
 	}
-	DPrintf("Vote data candidate %d voter %d, vote grant %v", args.CandidateId, rf.me, reply.VoteGranted)
+	DPrintf(dVote, "Vote data candidate %d voter %d, vote grant %v", args.CandidateId, rf.me, reply.VoteGranted)
 
 }
 
@@ -258,7 +258,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// first lets focus on append entries mode only.
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	DPrintf("appendEntries args.Term %d, rf.currentTerm %d", args.Term, rf.currentTerm)
+	DPrintf(dLog, "appendEntries args.Term %d, rf.currentTerm %d", args.Term, rf.currentTerm)
 	reply.Term = rf.currentTerm
 	if args.Term < rf.currentTerm {
 		reply.Success = false
@@ -267,16 +267,17 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.Entries == nil {
 		// considering as heartbeat, reset timer for heartbeats
-		DPrintf("server %d accepted appendEntries (HeartBeat) from %d", rf.me, args.LeaderId)
+		DPrintf(dLog, "server %d accepted appendEntries (HeartBeat) from %d", rf.me, args.LeaderId)
 		rf.ResetElectionTimer()
 		rf.state = 0
 		rf.currentTerm = args.Term
 		reply.Success = true
 		return
 	}
-	DPrintf("appendentries with some log entries?????")
+	DPrintf(dLog, "appendentries with some log entries?????")
 	// log entry check, for request prevlogindex and current logs index
 	// need to traverse log in reverse to find prevLogIndex entry or prevLogIndex entry isn't present
+
 	for i := len(rf.log) - 1; i >= 0; i-- {
 		if rf.log[i].Index == args.PrevLogIndex && rf.log[i].Term != args.PrevLogTerm {
 			// if the entry is found, then append the new entries
@@ -291,9 +292,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	newLogStartIndex := args.Entries[0].Index
 	// if current machin log index is greater or equal to new log start index then check commands
-	oldLogEndIndex := rf.log[len(rf.log)-1].Index
 
-	if oldLogEndIndex >= newLogStartIndex {
+	if len(rf.log) > 0 && rf.log[len(rf.log)-1].Index >= newLogStartIndex {
 		// do a for loop to check all the log entries & if theres a discrepancy delete the entries
 		// find index for newLogStartIndex entry in rf.log
 		actualInd := -1
@@ -344,10 +344,10 @@ func compareLogEntries(index1 int, index2 int, log1 []LogEntry, log2 []LogEntry)
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if reply.Term > rf.currentTerm {
+	if reply.Term > rf.currentTerm || !reply.Success {
 		ok = false
 	}
-	DPrintf("Leader %d sending append entry to %d, reply is %v", rf.me, server, ok)
+	DPrintf(dLeader, "Leader %d sending append entry to %d, reply is %v", rf.me, server, ok)
 	return ok
 }
 
@@ -358,9 +358,9 @@ func (rf *Raft) sendAppendEntries(sendLogs bool) {
 
 	if state == 2 {
 		if !sendLogs {
-			DPrintf("leader %d sending heartbeats", rf.me)
+			DPrintf(dLeader, "leader %d sending heartbeats", rf.me)
 		} else {
-			DPrintf("leader %d sending logs", rf.me)
+			DPrintf(dLeader, "leader %d sending logs", rf.me)
 		}
 		rf.mu.Lock()
 		var entries []LogEntry
@@ -375,6 +375,7 @@ func (rf *Raft) sendAppendEntries(sendLogs bool) {
 			Entries:  entries,
 		}
 		rf.mu.Unlock()
+		// send append entries and then copy the results to make sure majority has logs then update commit index
 		for server, _ := range rf.peers {
 			go func(peerId int) {
 				if peerId == rf.me {
@@ -404,9 +405,20 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
 	isLeader := true
-
+	rf.mu.Lock()
+	isLeader = rf.state == 2
+	rf.mu.Unlock()
+	if !isLeader {
+		return index, term, isLeader
+	}
 	// Your code here (2B).
+	// only if leader then process the command
+	rf.mu.Lock()
+	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm, Index: len(rf.log) + 1})
+	rf.mu.Unlock()
 
+	// as I believe that log is updated, I will send append entries to all followers
+	rf.sendAppendEntries(true)
 	return index, term, isLeader
 }
 
@@ -432,20 +444,11 @@ func (rf *Raft) killed() bool {
 	z := atomic.LoadInt32(&rf.dead)
 	return z == 1
 }
-
-func (rf *Raft) conductVoting() {
-	DPrintf("Conducting voting from %d", rf.me)
-	rf.mu.Lock()
-	if rf.state == 2 {
-		// you are leader dont need to do election here
-		DPrintf("Leader %d conducting voting so abandoning", rf.me)
-		rf.mu.Unlock()
-		return
-	}
+func (rf *Raft) initializeCandidateState() *RequestVoteArgs {
 	rf.state = 1
 	rf.currentTerm++
-	rf.ResetElectionTimer()
 	rf.votedFor = rf.me
+	rf.ResetElectionTimer()
 	lastLogTerm := 0
 	lastLogIndex := 0
 
@@ -460,12 +463,16 @@ func (rf *Raft) conductVoting() {
 		LastLogIndex: lastLogIndex,
 		LastLogTerm:  lastLogTerm,
 	}
+	return &voteArgs
+}
 
-	rf.mu.Unlock()
-
+func (rf *Raft) conductVoting(voteArgs *RequestVoteArgs) bool {
 	voteReceived := 1
 	voteGranted := 1
 	voteResultChan := make(chan bool)
+	rf.mu.Lock()
+	totalPeers := len(rf.peers)
+	rf.mu.Unlock()
 
 	for peer := 0; peer < len(rf.peers); peer++ {
 		if peer == rf.me {
@@ -473,9 +480,9 @@ func (rf *Raft) conductVoting() {
 		}
 
 		go func(peerId int) {
-			DPrintf("Vote asked to %d from %d", peerId, rf.me)
+			DPrintf(dVote, "Vote asked to %d from %d", peerId, rf.me)
 			voteReply := RequestVoteReply{}
-			ok := rf.sendRequestVote(peerId, &voteArgs, &voteReply)
+			ok := rf.sendRequestVote(peerId, voteArgs, &voteReply)
 			if ok {
 				voteResultChan <- voteReply.VoteGranted
 			} else {
@@ -485,34 +492,48 @@ func (rf *Raft) conductVoting() {
 	}
 
 	// calculate results
-	DPrintf("calculating results for candidate %d", rf.me)
+	DPrintf(dVote, "calculating results for candidate %d", rf.me)
 	for {
 		result := <-voteResultChan
 		voteReceived++
 		if result {
 			voteGranted++
 		}
-		if voteGranted > len(rf.peers)/2 {
+		if voteGranted > totalPeers/2 {
 			break
 		}
-		if voteReceived >= len(rf.peers) {
+		if voteReceived >= totalPeers {
 			break
 		}
 	}
+	return voteGranted > totalPeers/2
+}
 
+func (rf *Raft) conductElection() {
+	DPrintf(dVote, "Conducting voting from %d", rf.me)
 	rf.mu.Lock()
-	if rf.state == 1 && voteGranted > len(rf.peers)/2 {
+	if rf.state == 2 {
+		// you are leader dont need to do election here
+		DPrintf(dVote, "Leader %d conducting voting so abandoning", rf.me)
+		rf.mu.Unlock()
+		return
+	}
+	voteArgs := rf.initializeCandidateState()
+	rf.mu.Unlock()
+	hasMajority := rf.conductVoting(voteArgs)
+	rf.mu.Lock()
+	if rf.state == 1 && hasMajority {
 		rf.state = 2
 		rf.ResetElectionTimer()
 		rf.mu.Unlock()
-		DPrintf("New elected leader %d, for term %d sending out entries ", rf.me, rf.currentTerm)
+		DPrintf(dVote, "New elected leader %d, for term %d sending out entries ", rf.me, rf.currentTerm)
 		rf.sendAppendEntries(false)
 	} else if rf.state != 1 {
 		rf.mu.Unlock()
-		DPrintf("Candidate %d state changed  election setting abandoned", rf.me)
+		DPrintf(dVote, "Candidate %d state changed  election setting abandoned", rf.me)
 	} else {
 		rf.mu.Unlock()
-		DPrintf("Not enough votes received for candidate %d", rf.me)
+		DPrintf(dVote, "Not enough votes received for candidate %d", rf.me)
 	}
 }
 
@@ -520,10 +541,10 @@ func (rf *Raft) ticker() {
 	for !rf.killed() {
 		select {
 		case <-rf.electionTimeout.C:
-			DPrintf("Election timeout fired %d", rf.me)
-			rf.conductVoting()
+			DPrintf(dTimer, "Election timeout fired %d", rf.me)
+			rf.conductElection()
 		case <-rf.heartbeatTicker.C:
-			DPrintf("Heartbeat ticked for server %d ", rf.me)
+			DPrintf(dTimer, "Heartbeat ticked for server %d ", rf.me)
 			rf.sendAppendEntries(false)
 		}
 
