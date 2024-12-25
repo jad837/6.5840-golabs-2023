@@ -51,7 +51,6 @@ type ApplyMsg struct {
 type LogEntry struct {
 	Command interface{}
 	Term    int
-	Index   int
 }
 
 // A Go object implementing a single Raft peer.
@@ -183,7 +182,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		lastIndex := 0
 		if len(rf.log) > 0 {
 			lastTerm = rf.log[len(rf.log)-1].Term
-			lastIndex = rf.log[len(rf.log)-1].Index
+			lastIndex = len(rf.log) - 1
 		}
 		DPrintf(dVote, "args.lastLogTerm %d argsLastLogIndex %d, voter %d, voterLastIndex : %d, voterLastTerm :%d", args.LastLogTerm, args.LastLogIndex, rf.me, lastIndex, lastTerm)
 		if args.LastLogTerm >= lastTerm && lastIndex <= args.LastLogIndex {
@@ -260,7 +259,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	DPrintf(dLog, "appendEntries args.Term %d, rf.currentTerm %d", args.Term, rf.currentTerm)
 	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
+	// args.Term == rf.currentTerm && rf.state == 2 -> 2nd leader somewhere
+	if args.Term < rf.currentTerm || (args.Term == rf.currentTerm && rf.state == 2) {
 		reply.Success = false
 		return
 	}
@@ -278,75 +278,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	// log entry check, for request prevlogindex and current logs index
 	// need to traverse log in reverse to find prevLogIndex entry or prevLogIndex entry isn't present
 
-	for i := len(rf.log) - 1; i >= 0; i-- {
-		if rf.log[i].Index == args.PrevLogIndex && rf.log[i].Term != args.PrevLogTerm {
-			// if the entry is found, then append the new entries
-			// and update the commit index
-			reply.Term = rf.currentTerm
-			reply.Success = false
-			return
-		}
-	}
-	nextAppendIndex := -1
-	mismatchIndex := -1
-
-	newLogStartIndex := args.Entries[0].Index
-	// if current machin log index is greater or equal to new log start index then check commands
-
-	if len(rf.log) > 0 && rf.log[len(rf.log)-1].Index >= newLogStartIndex {
-		// do a for loop to check all the log entries & if theres a discrepancy delete the entries
-		// find index for newLogStartIndex entry in rf.log
-		actualInd := -1
-		for i := len(rf.log) - 1; i >= 0; i++ {
-			if rf.log[i].Index == newLogStartIndex {
-				actualInd = i
-				break
-			}
-		}
-
-		mismatchIndex, nextAppendIndex = compareLogEntries(actualInd, 0, rf.log, args.Entries)
-		if mismatchIndex != -1 {
-			// that means that anomaly exists and we will remove all logs after this entry and then append new ones.
-			// remove rf.log from misMatchIndex
-			rf.log = rf.log[:mismatchIndex]
-		}
-	}
-	if nextAppendIndex != -1 {
-		rf.log = append(rf.log, args.Entries[nextAppendIndex:]...)
-	}
-
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, rf.log[len(rf.log)-1].Index)
-	}
-	rf.ResetElectionTimer()
-	rf.currentTerm = args.Term
-	reply.Term = rf.currentTerm
-	reply.Success = true
-
-}
-
-func compareLogEntries(index1 int, index2 int, log1 []LogEntry, log2 []LogEntry) (int, int) {
-	for index1 < len(log1) && index2 < len(log2) {
-		if log1[index1].Term != log2[index2].Term {
-			return index1, index2
-		}
-		if log1[index1].Index != log2[index2].Index {
-			return index1, index2
-		}
-		if log1[index1].Command != log2[index2].Command {
-			return index1, index2
-		}
-		index1++
-		index2++
-	}
-	return -1, -1
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
-	if reply.Term > rf.currentTerm || !reply.Success {
-		ok = false
-	}
 	DPrintf(dLeader, "Leader %d sending append entry to %d, reply is %v", rf.me, server, ok)
 	return ok
 }
@@ -414,7 +349,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	// only if leader then process the command
 	rf.mu.Lock()
-	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm, Index: len(rf.log) + 1})
+	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
 	rf.mu.Unlock()
 
 	// as I believe that log is updated, I will send append entries to all followers
@@ -454,7 +389,7 @@ func (rf *Raft) initializeCandidateState() *RequestVoteArgs {
 
 	if len(rf.log) > 0 {
 		lastLogTerm = rf.log[len(rf.log)-1].Term
-		lastLogIndex = rf.log[len(rf.log)-1].Index
+		lastLogIndex = len(rf.log) - 1
 	}
 
 	voteArgs := RequestVoteArgs{
