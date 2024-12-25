@@ -22,24 +22,28 @@ func getVerbosity() int {
 }
 
 type logTopic string
+type logLevel string
+
+const (
+	dTrace logLevel = "TRACE"
+	dDebug logLevel = "DEBUG"
+	dWarn  logLevel = "WARN"
+	dInfo  logLevel = "INFO"
+	dError logLevel = "ERROR"
+)
 
 const (
 	dClient  logTopic = "CLNT"
+	dVote    logTopic = "VOTE"
 	dCommit  logTopic = "CMIT"
 	dDrop    logTopic = "DROP"
-	dError   logTopic = "ERRO"
-	dInfo    logTopic = "INFO"
 	dLeader  logTopic = "LEAD"
-	dLog     logTopic = "LOG1"
-	dLog2    logTopic = "LOG2"
 	dPersist logTopic = "PERS"
 	dSnap    logTopic = "SNAP"
 	dTerm    logTopic = "TERM"
-	dTest    logTopic = "TEST"
 	dTimer   logTopic = "TIMR"
-	dTrace   logTopic = "TRCE"
-	dVote    logTopic = "VOTE"
-	dWarn    logTopic = "WARN"
+	dLog     logTopic = "LOG"
+	dHtbt    logTopic = "HTBT"
 )
 
 var debugVerbosity int
@@ -55,24 +59,24 @@ func init() {
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
 
-func DPrintf(topic logTopic, format string, a ...interface{}) (n int, err error) {
-	if debugVerbosity > 0 {
-		time := time.Since(debugStart).Microseconds()
-		time /= 100
-		prefix := fmt.Sprintf("%06d [DEBUG] %v ", time, string(topic))
-		format = prefix + format
-		log.Printf(format, a...)
+func DLogF(topic logTopic, logLevel logLevel, peerId int, format string, a ...interface{}) (n int, err error) {
+	if logLevel == dTrace && debugVerbosity < 3 {
+		return
 	}
-	return
-}
+	if logLevel == dDebug && debugVerbosity < 2 {
+		return
+	}
+	if logLevel == dWarn && debugVerbosity < 1 {
+		return
+	}
+	if logLevel == dInfo && debugVerbosity < 0 {
+		return
+	}
 
-func IPrintf(topic logTopic, format string, a ...interface{}) (n int, err error) {
-	if Info {
-		time := time.Since(debugStart).Microseconds()
-		time /= 100
-		prefix := fmt.Sprintf("%06d [INFO] %v ", time, string(topic))
-		format = prefix + format
-		log.Printf(format, a...)
-	}
+	time := time.Since(debugStart).Microseconds()
+	time /= 100
+	prefix := fmt.Sprintf("%06d [S%d] [%s] [%s] ", time, peerId, logLevel, string(topic))
+	format = prefix + format
+	log.Printf(format, a...)
 	return
 }
