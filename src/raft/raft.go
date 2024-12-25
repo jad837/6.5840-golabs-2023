@@ -263,21 +263,50 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 		return
 	}
-
+	rf.ResetElectionTimer()
 	if args.Entries == nil {
 		// considering as heartbeat, reset timer for heartbeats
 		DLogF(dHtbt, dInfo, rf.me, "Accepted from %d", args.LeaderId)
 		if rf.state == 1 {
 			DLogF(dHtbt, dTrace, rf.me, "Changing back to follower from candidate")
 		}
-		rf.ResetElectionTimer()
 		rf.state = 0
 		rf.currentTerm = args.Term
 		reply.Success = true
 		return
 	}
-	DLogF(dLog, dInfo, rf.me, "appendentries with some log entries?????")
+	DLogF(dLog, dDebug, rf.me, "Trying to append logs")
+	myLastIndex := len(rf.log)
+	conflictIndex := myLastIndex
+	// if I am upto speed with leader then I need to check the log term and make sure that it matches mine.
+	if myLastIndex >= args.PrevLogIndex {
+		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			// cant proceed with appendEntries
+			reply.Success = false
+			return
+		}
+		// check point 3, same index but diff terms, delete existing entries and append new ones
+		for i := args.PrevLogIndex + 1; i < myLastIndex && i < len(args.Entries); i++ {
+			if args.Entries[i].Term != rf.log[i].Term {
+				// from this point onwards I will remove all log entries
+				conflictIndex = i
+				break
+			}
+		}
 
+		// remove conflicts
+		rf.log = rf.log[:conflictIndex]
+	} else {
+		conflictIndex = myLastIndex
+	}
+
+	rf.log = append(rf.log, args.Entries[conflictIndex:]...)
+	if args.LeaderCommit > rf.commitIndex {
+		rf.commitIndex = min(args.LeaderCommit, len(rf.log))
+	}
+	reply.Success = true
+	rf.currentTerm = args.Term
+	rf.state = 0
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -304,10 +333,20 @@ func (rf *Raft) sendAppendEntries(sendLogs bool) {
 		} else {
 			entries = rf.log
 		}
+		prevLogIndex := 0
+		prevLogTerm := 0
+
+		if len(rf.log) > 0 {
+			prevLogIndex = len(rf.log) - 1
+			prevLogTerm = rf.log[prevLogIndex-1].Term
+		}
 		args := AppendEntriesArgs{
-			Term:     rf.currentTerm,
-			LeaderId: rf.me,
-			Entries:  entries,
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			Entries:      entries,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			LeaderCommit: rf.commitIndex,
 		}
 		rf.mu.Unlock()
 		// send append entries and then copy the results to make sure majority has logs then update commit index
@@ -317,7 +356,8 @@ func (rf *Raft) sendAppendEntries(sendLogs bool) {
 					return
 				}
 				reply := AppendEntriesReply{}
-				rf.sendAppendEntry(server, &args, &reply)
+				ok := rf.sendAppendEntry(server, &args, &reply)
+
 			}(server)
 		}
 	}
@@ -384,7 +424,6 @@ func (rf *Raft) initializeCandidateState() *RequestVoteArgs {
 	rf.state = 1
 	rf.currentTerm++
 	rf.votedFor = rf.me
-	rf.ResetElectionTimer()
 	lastLogTerm := 0
 	lastLogIndex := 0
 
@@ -448,10 +487,11 @@ func (rf *Raft) conductVoting(voteArgs *RequestVoteArgs) bool {
 func (rf *Raft) conductElection() {
 	DLogF(dVote, dInfo, rf.me, "Conducting election")
 	rf.mu.Lock()
+	rf.ResetElectionTimer()
+
 	if rf.state == 2 {
 		// you are leader dont need to do election here
-		DLogF(dVote, dInfo, rf.me, "Abandoning election as I am leader", rf.me)
-		rf.ResetElectionTimer()
+		DLogF(dVote, dInfo, rf.me, "Abandoning election as I am leader")
 		rf.mu.Unlock()
 		return
 	}
@@ -461,7 +501,6 @@ func (rf *Raft) conductElection() {
 	rf.mu.Lock()
 	if rf.state == 1 && hasMajority {
 		rf.state = 2
-		rf.ResetElectionTimer()
 		rf.mu.Unlock()
 		DLogF(dVote, dInfo, rf.me, "Elected as leader for term %v ", rf.currentTerm)
 		rf.sendAppendEntries(false)

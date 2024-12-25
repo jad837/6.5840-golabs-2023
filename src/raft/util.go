@@ -60,16 +60,16 @@ func init() {
 }
 
 func DLogF(topic logTopic, logLevel logLevel, peerId int, format string, a ...interface{}) (n int, err error) {
-	if logLevel == dTrace && debugVerbosity < 3 {
+	if logLevel == dTrace && debugVerbosity < 4 {
 		return
 	}
-	if logLevel == dDebug && debugVerbosity < 2 {
+	if logLevel == dDebug && debugVerbosity < 3 {
 		return
 	}
-	if logLevel == dWarn && debugVerbosity < 1 {
+	if logLevel == dWarn && debugVerbosity < 2 {
 		return
 	}
-	if logLevel == dInfo && debugVerbosity < 0 {
+	if logLevel == dInfo && debugVerbosity < 1 {
 		return
 	}
 
