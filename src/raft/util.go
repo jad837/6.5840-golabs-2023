@@ -33,17 +33,18 @@ const (
 )
 
 const (
-	dClient  logTopic = "CLNT"
-	dVote    logTopic = "VOTE"
-	dCommit  logTopic = "CMIT"
-	dDrop    logTopic = "DROP"
-	dLeader  logTopic = "LEAD"
-	dPersist logTopic = "PERS"
-	dSnap    logTopic = "SNAP"
-	dTerm    logTopic = "TERM"
-	dTimer   logTopic = "TIMR"
-	dLog     logTopic = "LOG"
-	dHtbt    logTopic = "HTBT"
+	dClient   logTopic = "CLNT"
+	dVote     logTopic = "VOTE"
+	dCommit   logTopic = "CMIT"
+	dDrop     logTopic = "DROP"
+	dLeader   logTopic = "LEAD"
+	dPersist  logTopic = "PERS"
+	dSnap     logTopic = "SNAP"
+	dTerm     logTopic = "TERM"
+	dTimer    logTopic = "TIMR"
+	dLog      logTopic = "LOG"
+	dHtbt     logTopic = "HTBT"
+	dApplyMsg logTopic = "APMC"
 )
 
 var debugVerbosity int

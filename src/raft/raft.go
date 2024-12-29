@@ -79,6 +79,10 @@ type Raft struct {
 	// volatile for leader
 	nextIndex  []int
 	matchIndex []int
+
+	//2B for applychan
+	applyChan            chan ApplyMsg
+	applyChanCommitIndex int
 }
 
 // return currentTerm and whether this server
@@ -272,41 +276,40 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.state = 0
 		rf.currentTerm = args.Term
+		rf.commitIndex = args.LeaderCommit
 		reply.Success = true
 		return
 	}
 	DLogF(dLog, dDebug, rf.me, "Trying to append logs")
-	myLastIndex := len(rf.log)
-	conflictIndex := myLastIndex
-	// if I am upto speed with leader then I need to check the log term and make sure that it matches mine.
-	if myLastIndex >= args.PrevLogIndex {
-		if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			// cant proceed with appendEntries
-			reply.Success = false
-			return
-		}
-		// check point 3, same index but diff terms, delete existing entries and append new ones
-		for i := args.PrevLogIndex + 1; i < myLastIndex && i < len(args.Entries); i++ {
-			if args.Entries[i].Term != rf.log[i].Term {
-				// from this point onwards I will remove all log entries
-				conflictIndex = i
-				break
-			}
-		}
 
-		// remove conflicts
-		rf.log = rf.log[:conflictIndex]
+	if args.PrevLogIndex > rf.lastApplied {
+		DLogF(dLog, dDebug, rf.me, "Append Failured, reason: prevLogIndex:%d > lastApplied:%d ", args.PrevLogIndex, rf.lastApplied)
+		reply.Success = false
+		// as for previous term logs from leader how to??
+		return
+	} else if args.PrevLogIndex != -1 && rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// cant proceed with appendEntries due to term mismatch
+		reply.Success = false
+		return
 	} else {
-		conflictIndex = myLastIndex
+		// agreement on logs is done now applying the logs
+		lastApplied := rf.lastApplied
+		if lastApplied == -1 {
+			lastApplied = 0
+		}
+		DLogF(dLog, dDebug, rf.me, "Conflict index %d, argsprevindex %d, argsprevterm %d ", rf.lastApplied, args.PrevLogIndex, args.PrevLogTerm)
+		rf.log = append(rf.log[:rf.lastApplied+1], args.Entries[lastApplied:]...)
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log))
+		}
+		reply.Success = true
+		rf.currentTerm = args.Term
+		rf.lastApplied = len(rf.log)
+		rf.state = 0
+		rf.commitIndex = args.LeaderCommit
+		rf.ResetElectionTimer()
 	}
 
-	rf.log = append(rf.log, args.Entries[conflictIndex:]...)
-	if args.LeaderCommit > rf.commitIndex {
-		rf.commitIndex = min(args.LeaderCommit, len(rf.log))
-	}
-	reply.Success = true
-	rf.currentTerm = args.Term
-	rf.state = 0
 }
 
 func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -315,53 +318,122 @@ func (rf *Raft) sendAppendEntry(server int, args *AppendEntriesArgs, reply *Appe
 	return ok
 }
 
-func (rf *Raft) sendAppendEntries(sendLogs bool) {
+func (rf *Raft) broadcastHeartBeat() {
+	// not append entries logs
+	DLogF(dHtbt, dInfo, rf.me, "Leader heartbeat broadcast")
 	rf.mu.Lock()
-	state := rf.state
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		Entries:      nil,
+		LeaderCommit: rf.commitIndex,
+	}
+	rf.mu.Unlock()
+	for server := range rf.peers {
+		go func(peerId int) {
+			if peerId == rf.me {
+				return
+			}
+			reply := AppendEntriesReply{}
+			rf.sendAppendEntry(server, &args, &reply)
+		}(server)
+	}
+
+}
+
+type AEChanReply struct {
+	MatchIndex int
+	Success    bool
+	NextIndex  int
+	PeerId     int
+}
+
+func (rf *Raft) broadcastLogEntries() {
+	rf.mu.Lock()
+	// basic appendEntries which should be common for all servers
+	// once this is done matchindex will be used to update each args based on peerid
+	rf.ResetElectionTimer()
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		Entries:      rf.log,
+		LeaderCommit: rf.commitIndex,
+	}
 	rf.mu.Unlock()
 
-	if state == 2 {
-		if !sendLogs {
-			DLogF(dLeader, dTrace, rf.me, "HeartBeat")
-		} else {
-			DLogF(dLeader, dTrace, rf.me, "AppendEntries")
-		}
-		rf.mu.Lock()
-		var entries []LogEntry
-		if !sendLogs {
-			entries = nil
-		} else {
-			entries = rf.log
-		}
-		prevLogIndex := 0
-		prevLogTerm := 0
-
-		if len(rf.log) > 0 {
-			prevLogIndex = len(rf.log) - 1
-			prevLogTerm = rf.log[prevLogIndex-1].Term
-		}
-		args := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			Entries:      entries,
-			PrevLogIndex: prevLogIndex,
-			PrevLogTerm:  prevLogTerm,
-			LeaderCommit: rf.commitIndex,
-		}
-		rf.mu.Unlock()
-		// send append entries and then copy the results to make sure majority has logs then update commit index
-		for server, _ := range rf.peers {
-			go func(peerId int) {
-				if peerId == rf.me {
-					return
+	DLogF(dLog, dInfo, rf.me, "Broadcasting")
+	appendEntriesReplies := make(chan AEChanReply)
+	successPeers := 0
+	receivedPeers := 0
+	// send append entries and then copy the results to make sure majority has logs then update commit index
+	for server := range rf.peers {
+		DLogF(dLeader, dDebug, rf.me, "Broadcasting logs to peers")
+		peerNextIndex := rf.nextIndex[server]
+		go func(peerId int, nextIndex int) {
+			if peerId == rf.me {
+				return
+			}
+			reply := AppendEntriesReply{}
+			prevLogTerm := -1
+			if nextIndex != 0 {
+				prevLogTerm = args.Entries[nextIndex-1].Term
+			}
+			peerArgs := AppendEntriesArgs{
+				Term:         args.Term,
+				LeaderId:     args.LeaderId,
+				Entries:      args.Entries,
+				LeaderCommit: args.LeaderCommit,
+				PrevLogIndex: nextIndex - 1,
+				PrevLogTerm:  prevLogTerm,
+			}
+			ok := rf.sendAppendEntry(server, &peerArgs, &reply)
+			if ok && reply.Success {
+				// check the reply.success
+				appendEntriesReplies <- AEChanReply{
+					MatchIndex: len(args.Entries) - 1,
+					NextIndex:  len(args.Entries) - 1,
+					Success:    true,
+					PeerId:     peerId,
 				}
-				reply := AppendEntriesReply{}
-				ok := rf.sendAppendEntry(server, &args, &reply)
-
-			}(server)
+			} else {
+				DLogF(dLog, dTrace, server, "failed to appendEntries for nextindex %d", nextIndex)
+				appendEntriesReplies <- AEChanReply{
+					Success: false,
+					PeerId:  peerId,
+				}
+			}
+		}(server, peerNextIndex)
+	}
+	for {
+		reply := <-appendEntriesReplies
+		receivedPeers++
+		if reply.Success {
+			DLogF(dLog, dTrace, reply.PeerId, "Successfully appended log entry for %d", reply.NextIndex-1)
+			rf.mu.Lock()
+			rf.nextIndex[reply.PeerId] = reply.NextIndex
+			rf.matchIndex[reply.PeerId] = reply.MatchIndex
+			rf.mu.Unlock()
+			successPeers++
+		} else {
+			// huge gamble using -10 but couldnt logically make anything better
+			rf.mu.Lock()
+			rf.nextIndex[reply.PeerId] = min(0, rf.nextIndex[reply.PeerId]-10)
+			rf.mu.Unlock()
+		}
+		if receivedPeers == len(rf.peers) {
+			break
 		}
 	}
 
+	if successPeers > len(rf.peers)/2 {
+		// majority peers done
+		rf.mu.Lock()
+		rf.commitIndex = len(args.Entries) - 1
+		rf.ResetElectionTimer()
+		rf.mu.Unlock()
+	} else {
+		DLogF(dLog, dDebug, rf.me, "Unable to commit index due to insufficient append entries")
+	}
 }
 
 // the service using Raft (e.g. a k/v server) wants to start
@@ -388,12 +460,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 	// Your code here (2B).
 	// only if leader then process the command
+	DLogF(dClient, dInfo, rf.me, "Received command")
 	rf.mu.Lock()
 	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
+	rf.lastApplied++
 	rf.mu.Unlock()
-
+	DLogF(dLeader, dDebug, rf.me, "Received command currently log size %d", len(rf.log))
 	// as I believe that log is updated, I will send append entries to all followers
-	rf.sendAppendEntries(true)
+	rf.broadcastLogEntries()
 	return index, term, isLeader
 }
 
@@ -420,10 +494,20 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func (rf *Raft) initializeCandidateState() *RequestVoteArgs {
+func (rf *Raft) setCandidateState() {
+	// promote to candidate
 	rf.state = 1
 	rf.currentTerm++
+	//self voting
 	rf.votedFor = rf.me
+}
+
+func (rf *Raft) setFollowerState(term int) {
+
+}
+
+func (rf *Raft) initializeCandidateState() *RequestVoteArgs {
+	rf.setCandidateState()
 	lastLogTerm := 0
 	lastLogIndex := 0
 
@@ -485,29 +569,30 @@ func (rf *Raft) conductVoting(voteArgs *RequestVoteArgs) bool {
 }
 
 func (rf *Raft) conductElection() {
-	DLogF(dVote, dInfo, rf.me, "Conducting election")
 	rf.mu.Lock()
 	rf.ResetElectionTimer()
-
 	if rf.state == 2 {
 		// you are leader dont need to do election here
-		DLogF(dVote, dInfo, rf.me, "Abandoning election as I am leader")
+		DLogF(dVote, dDebug, rf.me, "Abandoning election as I am leader")
 		rf.mu.Unlock()
 		return
 	}
+	DLogF(dVote, dInfo, rf.me, "Conducting election")
 	voteArgs := rf.initializeCandidateState()
 	rf.mu.Unlock()
 	hasMajority := rf.conductVoting(voteArgs)
+
 	rf.mu.Lock()
-	if rf.state == 1 && hasMajority {
-		rf.state = 2
-		rf.mu.Unlock()
-		DLogF(dVote, dInfo, rf.me, "Elected as leader for term %v ", rf.currentTerm)
-		rf.sendAppendEntries(false)
-	} else if rf.state != 1 {
+	if rf.state != 1 {
 		rf.mu.Unlock()
 		DLogF(dVote, dDebug, rf.me, "Candidacy revoked for term %d", rf.currentTerm)
-	} else {
+	} else if rf.state == 1 && hasMajority {
+		rf.state = 2
+		rf.ResetElectionTimer()
+		rf.mu.Unlock()
+		DLogF(dVote, dInfo, rf.me, "Elected as leader for term %v ", rf.currentTerm)
+		rf.broadcastHeartBeat()
+	} else if rf.state == 1 && !hasMajority {
 		rf.mu.Unlock()
 		DLogF(dVote, dDebug, rf.me, "Lost election for term :%d ", rf.currentTerm)
 	}
@@ -521,7 +606,12 @@ func (rf *Raft) ticker() {
 			rf.conductElection()
 		case <-rf.heartbeatTicker.C:
 			DLogF(dHtbt, dInfo, rf.me, "Ticked")
-			rf.sendAppendEntries(false)
+			rf.mu.Lock()
+			state := rf.state
+			rf.mu.Unlock()
+			if state == 2 {
+				rf.broadcastHeartBeat()
+			}
 		}
 
 		// Your code here (2A)
@@ -532,6 +622,34 @@ func (rf *Raft) ticker() {
 		// ms := 50 + (rand.Int63() % 300)
 		// time.Sleep(time.Duration(ms) * time.Millisecond)
 	}
+}
+
+func (rf *Raft) applyCommands() {
+	go func() {
+		for {
+			if rf.applyChanCommitIndex < rf.commitIndex {
+
+				rf.mu.Lock()
+				startIndex := rf.applyChanCommitIndex
+				endIndex := rf.commitIndex
+				rf.mu.Unlock()
+				DLogF(dApplyMsg, dInfo, rf.me, "Aply Msg from: %d to: %d", startIndex, endIndex)
+				for i := startIndex + 1; i < endIndex+1; i++ {
+					rf.applyChan <- ApplyMsg{
+						Command:      rf.log[i].Command,
+						CommandIndex: i,
+					}
+				}
+				rf.mu.Lock()
+				rf.applyChanCommitIndex = endIndex
+				rf.mu.Unlock()
+				time.Sleep(50 * time.Millisecond)
+			} else {
+				DLogF(dApplyMsg, dDebug, rf.me, "No msg found for apply commitIndex: %d, applyCommitIndex: %d", rf.commitIndex, rf.applyChanCommitIndex)
+				time.Sleep(100 * time.Millisecond)
+			}
+		}
+	}()
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -556,11 +674,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 1
 	rf.electionTimeout = time.NewTimer(time.Duration(300+rand.Int31n(150)) * time.Millisecond)
 	rf.heartbeatTicker = time.NewTicker(100 * time.Millisecond)
+
+	// 2B
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.commitIndex = -1
+	rf.lastApplied = -1
+	rf.nextIndex = make([]int, len(rf.peers))
+	for i := 0; i < len(rf.peers); i++ {
+		rf.matchIndex[i] = -1
+		rf.nextIndex[i] = 0
+	}
+
+	rf.applyChanCommitIndex = rf.commitIndex
+	rf.applyChan = make(chan ApplyMsg)
+	rf.applyCommands()
+
 	// initialize from state persisted before a crash
+
 	rf.readPersist(persister.ReadRaftState())
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 	return rf
 }
