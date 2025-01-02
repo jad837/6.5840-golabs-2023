@@ -83,6 +83,7 @@ type Raft struct {
 	//2B for applychan
 	applyChan            chan ApplyMsg
 	applyChanCommitIndex int
+	applyCommandsTimer   *time.Timer
 }
 
 // return currentTerm and whether this server
@@ -301,8 +302,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			DLogF(dLog, dDebug, rf.me, "Initial state, Appending all log entries %d, argsprevindex %d, argsprevterm %d ", rf.lastApplied, args.PrevLogIndex, args.PrevLogTerm)
 			rf.log = append(rf.log, args.Entries...)
 		} else {
-		DLogF(dLog, dDebug, rf.me, "Conflict index %d, argsprevindex %d, argsprevterm %d ", rf.lastApplied, args.PrevLogIndex, args.PrevLogTerm)
-		rf.log = append(rf.log[:rf.lastApplied+1], args.Entries[lastApplied:]...)
+			DLogF(dLog, dDebug, rf.me, "Conflict index %d, argsprevindex %d, argsprevterm %d ", rf.lastApplied, args.PrevLogIndex, args.PrevLogTerm)
+			rf.log = append(rf.log[:rf.lastApplied+1], args.Entries[lastApplied:]...)
 		}
 		reply.Success = true
 		rf.currentTerm = args.Term
@@ -440,7 +441,7 @@ func (rf *Raft) broadcastLogEntries() {
 		// majority peers done
 		rf.mu.Lock()
 		if rf.state == 2 {
-		rf.commitIndex = len(args.Entries) - 1
+			rf.commitIndex = len(args.Entries) - 1
 		}
 		rf.mu.Unlock()
 		DLogF(dLog, dInfo, rf.me, "Commit index %d, & args.Entries", rf.commitIndex, len(args.Entries))
@@ -642,23 +643,23 @@ func (rf *Raft) ticker() {
 func (rf *Raft) applyCommands() {
 	DLogF(dApplyMsg, dInfo, rf.me, "Apply msg state %d, %d ", rf.applyChanCommitIndex, rf.commitIndex)
 	rf.applyCommandsTimer.Reset(50 * time.Millisecond)
-			if rf.applyChanCommitIndex < rf.commitIndex {
+	if rf.applyChanCommitIndex < rf.commitIndex {
 
-				rf.mu.Lock()
-				startIndex := rf.applyChanCommitIndex
-				endIndex := rf.commitIndex
-				rf.mu.Unlock()
-				DLogF(dApplyMsg, dInfo, rf.me, "Aply Msg from: %d to: %d", startIndex, endIndex)
+		rf.mu.Lock()
+		startIndex := rf.applyChanCommitIndex
+		endIndex := rf.commitIndex
+		rf.mu.Unlock()
+		DLogF(dApplyMsg, dInfo, rf.me, "Aply Msg from: %d to: %d", startIndex, endIndex)
 		for i := startIndex + 1; i <= endIndex; i++ {
-					rf.applyChan <- ApplyMsg{
-						Command:      rf.log[i].Command,
-						CommandIndex: i,
-					}
-				}
-				rf.mu.Lock()
-				rf.applyChanCommitIndex = endIndex
-				rf.mu.Unlock()
+			rf.applyChan <- ApplyMsg{
+				Command:      rf.log[i].Command,
+				CommandIndex: i,
 			}
+		}
+		rf.mu.Lock()
+		rf.applyChanCommitIndex = endIndex
+		rf.mu.Unlock()
+	}
 
 }
 
