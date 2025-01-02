@@ -276,7 +276,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 		rf.state = 0
 		rf.currentTerm = args.Term
-		rf.commitIndex = args.LeaderCommit
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, rf.lastApplied)
+		}
 		reply.Success = true
 		return
 	}
