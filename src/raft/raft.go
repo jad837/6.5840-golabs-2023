@@ -334,6 +334,7 @@ func (rf *Raft) broadcastHeartBeat() {
 		LeaderCommit: rf.commitIndex,
 	}
 	rf.mu.Unlock()
+	DLogF(dHtbt, dDebug, rf.me, "Broadcasting heartbeat with term %d, leaderId %d, commitIndex %d", args.Term, args.LeaderId, args.LeaderCommit)
 	for server := range rf.peers {
 		go func(peerId int) {
 			if peerId == rf.me {
@@ -351,13 +352,13 @@ type AEChanReply struct {
 	Success    bool
 	NextIndex  int
 	PeerId     int
+	Term       int
 }
 
 func (rf *Raft) broadcastLogEntries() {
 	rf.mu.Lock()
 	// basic appendEntries which should be common for all servers
 	// once this is done matchindex will be used to update each args based on peerid
-	rf.ResetElectionTimer()
 	args := AppendEntriesArgs{
 		Term:         rf.currentTerm,
 		LeaderId:     rf.me,
@@ -366,13 +367,15 @@ func (rf *Raft) broadcastLogEntries() {
 	}
 	rf.mu.Unlock()
 
-	DLogF(dLog, dInfo, rf.me, "Broadcasting")
+	DLogF(dLog, dInfo, rf.me, "Broadcasting, %d, %v", len(args.Entries), args.Entries)
 	appendEntriesReplies := make(chan AEChanReply)
-	successPeers := 0
-	receivedPeers := 0
+	successPeers := 1
+	receivedPeers := 1
 	// send append entries and then copy the results to make sure majority has logs then update commit index
 	for server := range rf.peers {
-		DLogF(dLeader, dDebug, rf.me, "Broadcasting logs to peers")
+		// DLogF(dLeader, dDebug, rf.me, "Broadcasting logs to peers")
+		DLogF(dLeader, dDebug, rf.me, "Broadcasting logs with entries Term: %d, LeaderId: %d, LeaderCommit: %d", args.Term, args.LeaderId, args.LeaderCommit)
+
 		peerNextIndex := rf.nextIndex[server]
 		go func(peerId int, nextIndex int) {
 			if peerId == rf.me {
@@ -396,15 +399,17 @@ func (rf *Raft) broadcastLogEntries() {
 				// check the reply.success
 				appendEntriesReplies <- AEChanReply{
 					MatchIndex: len(args.Entries) - 1,
-					NextIndex:  len(args.Entries) - 1,
+					NextIndex:  len(args.Entries),
 					Success:    true,
 					PeerId:     peerId,
+					Term:       reply.Term,
 				}
 			} else {
 				DLogF(dLog, dTrace, server, "failed to appendEntries for nextindex %d", nextIndex)
 				appendEntriesReplies <- AEChanReply{
 					Success: false,
 					PeerId:  peerId,
+					Term:    reply.Term,
 				}
 			}
 		}(server, peerNextIndex)
@@ -413,7 +418,7 @@ func (rf *Raft) broadcastLogEntries() {
 		reply := <-appendEntriesReplies
 		receivedPeers++
 		if reply.Success {
-			DLogF(dLog, dTrace, reply.PeerId, "Successfully appended log entry for %d", reply.NextIndex-1)
+			DLogF(dLog, dTrace, reply.PeerId, "Successfully appended log entry for %d", reply.NextIndex)
 			rf.mu.Lock()
 			rf.nextIndex[reply.PeerId] = reply.NextIndex
 			rf.matchIndex[reply.PeerId] = reply.MatchIndex
@@ -429,13 +434,16 @@ func (rf *Raft) broadcastLogEntries() {
 			break
 		}
 	}
-
+	DLogF(dLog, dDebug, rf.me, "Success peers is %d", successPeers)
 	if successPeers > len(rf.peers)/2 {
+		DLogF(dLog, dInfo, rf.me, "Majority achieved")
 		// majority peers done
 		rf.mu.Lock()
+		if rf.state == 2 {
 		rf.commitIndex = len(args.Entries) - 1
-		rf.ResetElectionTimer()
+		}
 		rf.mu.Unlock()
+		DLogF(dLog, dInfo, rf.me, "Commit index %d, & args.Entries", rf.commitIndex, len(args.Entries))
 	} else {
 		DLogF(dLog, dDebug, rf.me, "Unable to commit index due to insufficient append entries")
 	}
@@ -468,11 +476,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	DLogF(dClient, dInfo, rf.me, "Received command")
 	rf.mu.Lock()
 	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
-	rf.lastApplied++
+	rf.lastApplied = len(rf.log) - 1
 	rf.mu.Unlock()
 	DLogF(dLeader, dDebug, rf.me, "Received command currently log size %d", len(rf.log))
 	// as I believe that log is updated, I will send append entries to all followers
-	rf.broadcastLogEntries()
+	go rf.broadcastLogEntries()
 	return index, term, isLeader
 }
 
@@ -607,16 +615,18 @@ func (rf *Raft) ticker() {
 	for !rf.killed() {
 		select {
 		case <-rf.electionTimeout.C:
-			DLogF(dTimer, dInfo, rf.me, "Start election")
 			rf.conductElection()
 		case <-rf.heartbeatTicker.C:
 			DLogF(dHtbt, dInfo, rf.me, "Ticked")
+			DLogF(dHtbt, dDebug, rf.me, "Commit index %d, lastApplied %d, chan commit index %d", rf.commitIndex, rf.lastApplied, rf.applyChanCommitIndex)
 			rf.mu.Lock()
 			state := rf.state
 			rf.mu.Unlock()
 			if state == 2 {
-				rf.broadcastHeartBeat()
+				go rf.broadcastHeartBeat()
 			}
+		case <-rf.applyCommandsTimer.C:
+			go rf.applyCommands()
 		}
 
 		// Your code here (2A)
@@ -630,8 +640,8 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) applyCommands() {
-	go func() {
-		for {
+	DLogF(dApplyMsg, dInfo, rf.me, "Apply msg state %d, %d ", rf.applyChanCommitIndex, rf.commitIndex)
+	rf.applyCommandsTimer.Reset(50 * time.Millisecond)
 			if rf.applyChanCommitIndex < rf.commitIndex {
 
 				rf.mu.Lock()
@@ -639,7 +649,7 @@ func (rf *Raft) applyCommands() {
 				endIndex := rf.commitIndex
 				rf.mu.Unlock()
 				DLogF(dApplyMsg, dInfo, rf.me, "Aply Msg from: %d to: %d", startIndex, endIndex)
-				for i := startIndex + 1; i < endIndex+1; i++ {
+		for i := startIndex + 1; i <= endIndex; i++ {
 					rf.applyChan <- ApplyMsg{
 						Command:      rf.log[i].Command,
 						CommandIndex: i,
@@ -648,13 +658,8 @@ func (rf *Raft) applyCommands() {
 				rf.mu.Lock()
 				rf.applyChanCommitIndex = endIndex
 				rf.mu.Unlock()
-				time.Sleep(50 * time.Millisecond)
-			} else {
-				DLogF(dApplyMsg, dDebug, rf.me, "No msg found for apply commitIndex: %d, applyCommitIndex: %d", rf.commitIndex, rf.applyChanCommitIndex)
-				time.Sleep(100 * time.Millisecond)
 			}
-		}
-	}()
+
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -681,6 +686,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.heartbeatTicker = time.NewTicker(100 * time.Millisecond)
 
 	// 2B
+	rf.log = make([]LogEntry, 0)
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.commitIndex = -1
 	rf.lastApplied = -1
@@ -691,8 +697,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	}
 
 	rf.applyChanCommitIndex = rf.commitIndex
-	rf.applyChan = make(chan ApplyMsg)
-	rf.applyCommands()
+	rf.applyChan = applyCh
+	rf.applyCommandsTimer = time.NewTimer(20 * time.Millisecond)
 
 	// initialize from state persisted before a crash
 
