@@ -303,15 +303,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		} else {
 		DLogF(dLog, dDebug, rf.me, "Conflict index %d, argsprevindex %d, argsprevterm %d ", rf.lastApplied, args.PrevLogIndex, args.PrevLogTerm)
 		rf.log = append(rf.log[:rf.lastApplied+1], args.Entries[lastApplied:]...)
-		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(args.LeaderCommit, len(rf.log))
 		}
 		reply.Success = true
 		rf.currentTerm = args.Term
-		rf.lastApplied = len(rf.log)
+		reply.Term = rf.currentTerm
+		rf.lastApplied = len(rf.log) - 1
 		rf.state = 0
-		rf.commitIndex = args.LeaderCommit
-		rf.ResetElectionTimer()
+		if args.LeaderCommit > rf.commitIndex {
+			rf.commitIndex = min(args.LeaderCommit, rf.lastApplied)
+		}
+		DLogF(dLog, dDebug, rf.me, "Log state after applying is %d, %d", len(rf.log), rf.lastApplied)
 	}
 
 }
