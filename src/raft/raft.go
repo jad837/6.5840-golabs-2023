@@ -297,8 +297,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		// agreement on logs is done now applying the logs
 		lastApplied := rf.lastApplied
 		if lastApplied == -1 {
-			lastApplied = 0
-		}
+			// initial state no logs appended so append all logs
+			DLogF(dLog, dDebug, rf.me, "Initial state, Appending all log entries %d, argsprevindex %d, argsprevterm %d ", rf.lastApplied, args.PrevLogIndex, args.PrevLogTerm)
+			rf.log = append(rf.log, args.Entries...)
+		} else {
 		DLogF(dLog, dDebug, rf.me, "Conflict index %d, argsprevindex %d, argsprevterm %d ", rf.lastApplied, args.PrevLogIndex, args.PrevLogTerm)
 		rf.log = append(rf.log[:rf.lastApplied+1], args.Entries[lastApplied:]...)
 		if args.LeaderCommit > rf.commitIndex {
