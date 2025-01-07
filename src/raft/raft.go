@@ -81,9 +81,8 @@ type Raft struct {
 	matchIndex []int
 
 	//2B for applychan
-	applyChan            chan ApplyMsg
-	applyChanCommitIndex int
-	applyCommandsTimer   *time.Timer
+	applyChan          chan ApplyMsg
+	applyCommandsTimer *time.Timer
 }
 
 // return currentTerm and whether this server
@@ -174,9 +173,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	DLogF(dVote, dDebug, rf.me, "vote request myTerm %d, candidateTerm %d", rf.currentTerm, args.Term)
 	if args.Term >= rf.currentTerm {
 		if args.Term > rf.currentTerm {
-			rf.state = 0
-			rf.votedFor = -1
-			rf.currentTerm = args.Term
+			rf.setFollowerState(args.Term, -1)
 		}
 
 		if rf.votedFor == -1 || rf.votedFor == args.CandidateId {
@@ -195,7 +192,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 			reply.VoteGranted = false
 		}
 	}
-	DLogF(dVote, dInfo, rf.me, "Voted %v to candidate %d for term", reply.VoteGranted, args.CandidateId)
+	DLogF(dVote, dInfo, rf.me, "Voted %v to candidate %d for term %d", reply.VoteGranted, args.CandidateId, args.Term)
 
 }
 
@@ -274,18 +271,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DLogF(dHtbt, dInfo, rf.me, "Accepted from %d", args.LeaderId)
 		if rf.state == 1 {
 			DLogF(dHtbt, dTrace, rf.me, "Changing back to follower from candidate")
+			rf.setFollowerState(args.Term, rf.votedFor)
 		}
-		rf.state = 0
-		rf.currentTerm = args.Term
 		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(args.LeaderCommit, rf.lastApplied)
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		}
 		reply.Success = true
+		reply.Term = rf.currentTerm
 		return
 	}
 	DLogF(dLog, dDebug, rf.me, "Trying to append logs")
-
-	if args.PrevLogIndex > rf.lastApplied {
+	lastLogIndex := len(rf.log) - 1
+	if args.PrevLogIndex > lastLogIndex {
 		DLogF(dLog, dDebug, rf.me, "Append Failured, reason: prevLogIndex:%d > lastApplied:%d ", args.PrevLogIndex, rf.lastApplied)
 		reply.Success = false
 		// as for previous term logs from leader how to??
@@ -296,23 +293,21 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	} else {
 		// agreement on logs is done now applying the logs
-		lastApplied := rf.lastApplied
-		if lastApplied == -1 {
+		if lastLogIndex < 0 {
 			// initial state no logs appended so append all logs
 			DLogF(dLog, dDebug, rf.me, "Initial state, Appending all log entries %d, argsprevindex %d, argsprevterm %d ", rf.lastApplied, args.PrevLogIndex, args.PrevLogTerm)
 			rf.log = append(rf.log, args.Entries...)
 		} else {
-			DLogF(dLog, dDebug, rf.me, "Conflict index %d, argsprevindex %d, argsprevterm %d ", rf.lastApplied, args.PrevLogIndex, args.PrevLogTerm)
-			rf.log = append(rf.log[:rf.lastApplied+1], args.Entries[lastApplied:]...)
+			DLogF(dLog, dDebug, rf.me, "Conflict index %d, argsprevindex %d, argsprevterm %d ", lastLogIndex, args.PrevLogIndex, args.PrevLogTerm)
+			rf.log = append(rf.log[:lastLogIndex+1], args.Entries[lastLogIndex:]...)
 		}
-		reply.Success = true
-		rf.currentTerm = args.Term
-		reply.Term = rf.currentTerm
-		rf.lastApplied = len(rf.log) - 1
-		rf.state = 0
+		rf.setFollowerState(args.Term, rf.votedFor)
+
 		if args.LeaderCommit > rf.commitIndex {
-			rf.commitIndex = min(args.LeaderCommit, rf.lastApplied)
+			rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 		}
+		reply.Term = rf.currentTerm
+		reply.Success = true
 		DLogF(dLog, dDebug, rf.me, "Log state after applying is %d, %d", len(rf.log), rf.lastApplied)
 	}
 
@@ -444,7 +439,7 @@ func (rf *Raft) broadcastLogEntries() {
 			rf.commitIndex = len(args.Entries) - 1
 		}
 		rf.mu.Unlock()
-		DLogF(dLog, dInfo, rf.me, "Commit index %d, & args.Entries", rf.commitIndex, len(args.Entries))
+		DLogF(dLog, dInfo, rf.me, "Commit index %d, & args.Entries %d", rf.commitIndex, len(args.Entries))
 	} else {
 		DLogF(dLog, dDebug, rf.me, "Unable to commit index due to insufficient append entries")
 	}
@@ -470,6 +465,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader = rf.state == 2
 	rf.mu.Unlock()
 	if !isLeader {
+		DLogF(dClient, dDebug, rf.me, "GOT COMMAND EVEN THOUGH NOT LEADER")
 		return index, term, isLeader
 	}
 	// Your code here (2B).
@@ -477,7 +473,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	DLogF(dClient, dInfo, rf.me, "Received command")
 	rf.mu.Lock()
 	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
-	rf.lastApplied = len(rf.log) - 1
+	index = len(rf.log) - 1
+	term = rf.currentTerm
 	rf.mu.Unlock()
 	DLogF(dLeader, dDebug, rf.me, "Received command currently log size %d", len(rf.log))
 	// as I believe that log is updated, I will send append entries to all followers
@@ -516,8 +513,10 @@ func (rf *Raft) setCandidateState() {
 	rf.votedFor = rf.me
 }
 
-func (rf *Raft) setFollowerState(term int) {
-
+func (rf *Raft) setFollowerState(term int, votedFor int) {
+	rf.state = 0
+	rf.currentTerm = term
+	rf.votedFor = votedFor
 }
 
 func (rf *Raft) initializeCandidateState() *RequestVoteArgs {
@@ -619,15 +618,15 @@ func (rf *Raft) ticker() {
 			rf.conductElection()
 		case <-rf.heartbeatTicker.C:
 			DLogF(dHtbt, dInfo, rf.me, "Ticked")
-			DLogF(dHtbt, dDebug, rf.me, "Commit index %d, lastApplied %d, chan commit index %d", rf.commitIndex, rf.lastApplied, rf.applyChanCommitIndex)
+			DLogF(dHtbt, dDebug, rf.me, "Commit index %d, lastApplied %d", rf.commitIndex, rf.lastApplied)
 			rf.mu.Lock()
 			state := rf.state
 			rf.mu.Unlock()
 			if state == 2 {
-				go rf.broadcastHeartBeat()
+				rf.broadcastHeartBeat()
 			}
-		case <-rf.applyCommandsTimer.C:
-			go rf.applyCommands()
+			// case <-rf.applyCommandsTimer.C:
+			// 	go rf.applyCommands()
 		}
 
 		// Your code here (2A)
@@ -641,12 +640,12 @@ func (rf *Raft) ticker() {
 }
 
 func (rf *Raft) applyCommands() {
-	DLogF(dApplyMsg, dInfo, rf.me, "Apply msg state %d, %d ", rf.applyChanCommitIndex, rf.commitIndex)
+	DLogF(dApplyMsg, dInfo, rf.me, "Apply msg state %d, %d ", rf.lastApplied, rf.commitIndex)
 	rf.applyCommandsTimer.Reset(50 * time.Millisecond)
-	if rf.applyChanCommitIndex < rf.commitIndex {
+	if rf.lastApplied < rf.commitIndex {
 
 		rf.mu.Lock()
-		startIndex := rf.applyChanCommitIndex
+		startIndex := rf.lastApplied + 1
 		endIndex := rf.commitIndex
 		rf.mu.Unlock()
 		DLogF(dApplyMsg, dInfo, rf.me, "Aply Msg from: %d to: %d", startIndex, endIndex)
@@ -655,10 +654,11 @@ func (rf *Raft) applyCommands() {
 				Command:      rf.log[i].Command,
 				CommandIndex: i,
 			}
+			rf.mu.Lock()
+			rf.lastApplied++
+			rf.mu.Unlock()
 		}
-		rf.mu.Lock()
-		rf.applyChanCommitIndex = endIndex
-		rf.mu.Unlock()
+
 	}
 
 }
@@ -696,8 +696,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		rf.matchIndex[i] = -1
 		rf.nextIndex[i] = 0
 	}
-
-	rf.applyChanCommitIndex = rf.commitIndex
 	rf.applyChan = applyCh
 	rf.applyCommandsTimer = time.NewTimer(20 * time.Millisecond)
 
