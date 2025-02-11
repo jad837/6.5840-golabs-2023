@@ -24,29 +24,6 @@ func getVerbosity() int {
 type logTopic string
 type logLevel string
 
-const (
-	dTrace logLevel = "TRACE"
-	dDebug logLevel = "DEBUG"
-	dWarn  logLevel = "WARN"
-	dInfo  logLevel = "INFO"
-	dError logLevel = "ERROR"
-)
-
-const (
-	dClient   logTopic = "CLNT"
-	dVote     logTopic = "VOTE"
-	dCommit   logTopic = "CMIT"
-	dDrop     logTopic = "DROP"
-	dLeader   logTopic = "LEAD"
-	dPersist  logTopic = "PERS"
-	dSnap     logTopic = "SNAP"
-	dTerm     logTopic = "TERM"
-	dTimer    logTopic = "TIMR"
-	dLog      logTopic = "LOG"
-	dHtbt     logTopic = "HTBT"
-	dApplyMsg logTopic = "APMC"
-)
-
 var debugVerbosity int
 var debugStart time.Time
 
