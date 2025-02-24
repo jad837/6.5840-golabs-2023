@@ -51,7 +51,7 @@ func DLogF(topic logTopic, logLevel logLevel, peerId int, format string, a ...in
 		return
 	}
 
-	time := time.Since(debugStart).Microseconds()
+	time := time.Since(debugStart).Milliseconds()
 	time /= 100
 	prefix := fmt.Sprintf("%06d [S%d] [%s] [%s] ", time, peerId, logLevel, string(topic))
 	format = prefix + format

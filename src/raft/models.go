@@ -46,9 +46,9 @@ type LogEntry struct {
 }
 
 const (
-	Leader    uint8 = 2
-	Candidate uint8 = 1
-	Follower  uint8 = 0
+	Leader    int = 2
+	Candidate int = 1
+	Follower  int = 0
 )
 
 const (
@@ -62,14 +62,15 @@ const (
 const (
 	dClient   logTopic = "CLNT"
 	dVote     logTopic = "VOTE"
+	dElec     logTopic = "ELEC"
+	dTerm     logTopic = "TERM"
+	dLeader   logTopic = "LEAD"
+	dHtbt     logTopic = "HTBT"
 	dCommit   logTopic = "CMIT"
 	dDrop     logTopic = "DROP"
-	dLeader   logTopic = "LEAD"
 	dPersist  logTopic = "PERS"
 	dSnap     logTopic = "SNAP"
-	dTerm     logTopic = "TERM"
 	dTimer    logTopic = "TIMR"
 	dLog      logTopic = "LOG"
-	dHtbt     logTopic = "HTBT"
 	dApplyMsg logTopic = "APMC"
 )
