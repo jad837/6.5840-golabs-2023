@@ -193,16 +193,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func getRandomizedElectionTimer() time.Duration {
-	return time.Duration(350+rand.Int()%150) * time.Millisecond
+	ms := time.Duration(250 + rand.Int()%100)
+	return time.Duration(ms * time.Millisecond)
 }
 
 func getHeartbeattimer() time.Duration {
-	return time.Duration(100) * time.Millisecond
+	return time.Duration(100 * time.Millisecond)
 }
 
 func (rf *Raft) ResetElectionTime() {
 	ms := getRandomizedElectionTimer()
-	DLogF(dTimer, dDebug, rf.me, "Electiontimer reset to %d", ms)
+	DLogF(dTimer, dDebug, rf.me, "Electiontimer reset to %v", ms)
 	rf.electionTimer.Reset(ms)
 }
 
