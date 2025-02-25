@@ -155,25 +155,36 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	reply.Term = rf.currentTerm
-	reply.VoteGranted = false
-	if args.Term < rf.currentTerm || rf.killed() {
-		DLogF(dVote, dDebug, rf.me, "Rejected to=%d, term=%d, isKilled=%v", args.CandidateId, args.Term, rf.killed())
+	// TODO's add log mismatch, before voting
+	if args.Term == rf.currentTerm && rf.votedFor == args.CandidateId {
+		DLogF(dVote, dDebug, rf.me, "Granted vote again for this term %d, to %d", args.Term, rf.votedFor)
+		reply.VoteGranted, reply.Term = true, rf.currentTerm
 		return
 	}
-	// TODO's add log mismatch, before voting
+
+	if args.Term < rf.currentTerm || rf.killed() || (rf.currentTerm == args.Term && rf.votedFor != -1) {
+		DLogF(dVote, dDebug, rf.me, "Rejected to=%d, term=%d, isKilled=%v, alreadyVotedForterm=%v", args.CandidateId, args.Term, rf.killed(), rf.currentTerm == args.Term && rf.votedFor != -1)
+		reply.Term = rf.currentTerm
+		reply.VoteGranted = false
+		return
+	}
 
 	if args.Term > rf.currentTerm {
 		DLogF(dVote, dDebug, rf.me, "Higher term found, perhaps new leader leadterm=%d, myterm=%d", args.Term, rf.currentTerm)
-		rf.setFollowerState(args.Term, -1)
-		rf.ResetElectionTime()
+		rf.currentTerm = args.Term
+
+		rf.votedFor = -1
+		if rf.state != Follower {
+			rf.state = Follower
+			rf.ResetElectionTime()
+		}
 	}
 
 	if rf.votedFor == -1 {
-		rf.setFollowerState(args.Term, args.CandidateId)
-		rf.ResetElectionTime()
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		rf.ResetElectionTime()
 		DLogF(dVote, dDebug, rf.me, "Granted to:%d, for term:%d", rf.votedFor, rf.currentTerm)
 		return
 	} else {
@@ -181,35 +192,44 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 }
 
+func getRandomizedElectionTimer() time.Duration {
+	return time.Duration(350+rand.Int()%150) * time.Millisecond
+}
+
+func getHeartbeattimer() time.Duration {
+	return time.Duration(100) * time.Millisecond
+}
+
 func (rf *Raft) ResetElectionTime() {
-	ms := 400 + rand.Int()%300
-	DLogF(dTimer, dDebug, rf.me, "Electiontimer reset to %d", time.Duration(ms)*time.Millisecond)
-	rf.electionTimer.Reset(time.Duration(ms) * time.Millisecond)
+	ms := getRandomizedElectionTimer()
+	DLogF(dTimer, dDebug, rf.me, "Electiontimer reset to %d", ms)
+	rf.electionTimer.Reset(ms)
 }
 
 // AppendEntries RPC handler
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	if args.Term < rf.currentTerm || rf.killed() {
+	if args.Term < rf.currentTerm {
 		DLogF(dLog, dDebug, rf.me, "Rejecting AppendEntries from=%d", args.LeaderId)
 		reply.Term = rf.currentTerm
 		reply.Success = false
 		return
 	}
-	if args.Term > rf.currentTerm || (rf.currentTerm == args.Term && rf.state == Candidate) {
+	reply.Term = args.Term
+	if args.Term > rf.currentTerm {
 		// I am lagging as leader so I should abandone being leader
 		DLogF(dLog, dDebug, rf.me, "New leader found, leader=%d, term=%d", args.LeaderId, args.Term)
-		rf.setFollowerState(args.Term, -1)
-		rf.ResetElectionTime()
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
 	}
+	rf.state = Follower
 	if len(args.Entries) == 0 {
 		// empty log Heartbeat
 		DLogF(dHtbt, dDebug, rf.me, "Received from=%d", args.LeaderId)
 		reply.Term = rf.currentTerm
 		reply.Success = true
 		rf.ResetElectionTime()
-		// RESET ELECTION TIMER
 		return
 	}
 }
@@ -230,7 +250,6 @@ func (rf *Raft) setCandidateState() {
 	rf.state = Candidate
 	rf.currentTerm++
 	rf.votedFor = rf.me
-	rf.ResetElectionTime()
 }
 
 func (rf *Raft) conductElection() {
@@ -240,26 +259,30 @@ func (rf *Raft) conductElection() {
 			DLogF(dElec, dDebug, rf.me, "Timeout for conductElection term=%d", rf.currentTerm)
 			rf.electionCancel()
 			rf.electionCancel = nil
-		} else {
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		rf.electionCtx = ctx
+		rf.electionCancel = cancel
+		if rf.state == Follower {
 			rf.setCandidateState()
 		}
-		rf.electionCtx, rf.electionCancel = context.WithCancel(context.Background())
+		rf.ResetElectionTime()
+		myTerm := rf.currentTerm
+
 		args := &RequestVoteArgs{
-			Term:        rf.currentTerm,
+			Term:        myTerm,
 			CandidateId: rf.me,
 		}
 		rf.mu.Unlock()
-		votesReceived := 1
-		votesGranted := 1
 
 		resultChan := make(chan *RequestVoteReply, len(rf.peers)-1)
 		var wg sync.WaitGroup
-		wg.Add(len(rf.peers) - 1)
 		// ask for votes using goroutine
 		for server := range rf.peers {
 			if server == rf.me {
 				continue
 			}
+			wg.Add(1)
 			go func(server int) {
 				defer wg.Done()
 				reply := RequestVoteReply{}
@@ -274,31 +297,34 @@ func (rf *Raft) conductElection() {
 		wg.Wait()
 		close(resultChan)
 		//self voting
+
+		votesGranted := 1
+
 		for result := range resultChan {
-			votesReceived++
 			if result.VoteGranted {
-				//
 				votesGranted++
 			} else if result.Term > args.Term {
 				//abandone election as someone with higher term is already a leader
-				DLogF(dElec, dDebug, rf.me, "Abandone Election leaderterm=%d", result.Term)
+				DLogF(dElec, dDebug, rf.me, "Abandone Counting votes leaderterm=%d", result.Term)
 				rf.mu.Lock()
-				rf.setFollowerState(result.Term, -1)
-				rf.ResetElectionTime()
+				if rf.currentTerm < result.Term {
+					rf.setFollowerState(result.Term, -1)
+					rf.ResetElectionTime()
+				}
 				rf.mu.Unlock()
 				break
 			}
 		}
-
-		if votesGranted >= len(rf.peers)/2 && rf.state == Candidate {
+		rf.mu.Lock()
+		defer rf.mu.Unlock()
+		if votesGranted > len(rf.peers)/2 && rf.state == Candidate {
 			DLogF(dElec, dDebug, rf.me, "Election won...")
-			rf.mu.Lock()
 			rf.setLeaderState()
-			rf.mu.Unlock()
+			rf.ResetElectionTime()
 			go rf.broadcastHeartbeat()
+		} else {
+			DLogF(dElec, dDebug, rf.me, "Election lost...state=%v,votesG=%d", rf.state, votesGranted)
 		}
-		rf.electionCtx.Done()
-		rf.electionCancel = nil
 	}
 }
 
@@ -325,7 +351,7 @@ func (rf *Raft) broadcastHeartbeat() {
 
 func (rf *Raft) setLeaderState() {
 	rf.state = Leader
-	rf.heartbeatTicker = time.NewTicker(time.Duration(100) * time.Millisecond)
+	rf.heartbeatTicker = time.NewTicker(getHeartbeattimer())
 	// start heartbeattimer?
 }
 
@@ -400,6 +426,10 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.mu.Lock()
+	rf.state = Follower
+	rf.heartbeatTicker.Stop()
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) killed() bool {
@@ -412,7 +442,7 @@ func (rf *Raft) ticker() {
 		select {
 		case <-rf.electionTimer.C:
 			rf.mu.Lock()
-			if !rf.killed() && rf.state != Leader {
+			if !rf.killed() {
 				go rf.conductElection()
 			}
 			rf.mu.Unlock()
@@ -441,8 +471,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
-	rf.heartbeatTicker = time.NewTicker(time.Duration(100) * time.Millisecond)
-	rf.electionTimer = time.NewTimer(time.Duration(250+rand.Int()%300) * time.Millisecond)
+	rf.heartbeatTicker = time.NewTicker(getHeartbeattimer())
+	rf.electionTimer = time.NewTimer(getRandomizedElectionTimer())
 	rf.setFollowerState(1, -1)
 	rf.log = make([]LogEntry, 0)
 

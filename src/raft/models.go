@@ -1,5 +1,7 @@
 package raft
 
+import "fmt"
+
 type AEChanReply struct {
 	MatchIndex int
 	Success    bool
@@ -38,6 +40,10 @@ type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int
 	VoteGranted bool
+}
+
+func (reply *RequestVoteReply) String() string {
+	return fmt.Sprintf("RequestVoteReply{Term: %d, VoteGranted: %t}", reply.Term, reply.VoteGranted)
 }
 
 type LogEntry struct {
