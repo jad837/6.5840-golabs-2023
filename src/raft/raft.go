@@ -85,15 +85,10 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
 	// Your code here (2A).
 	rf.mu.Lock()
-	term = rf.currentTerm
-	isleader = rf.state == Leader
-	rf.mu.Unlock()
-	return term, isleader
+	defer rf.mu.Unlock()
+	return rf.currentTerm, rf.state == Leader
 }
 
 // save Raft's persistent state to stable storage,
@@ -147,7 +142,6 @@ func (rf *Raft) setFollowerState(term int, votedFor int) {
 	rf.state = Follower
 	rf.votedFor = votedFor
 	rf.currentTerm = term
-	rf.heartbeatTicker.Stop()
 }
 
 // example RequestVote RPC handler.
@@ -162,8 +156,8 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		return
 	}
 
-	if args.Term < rf.currentTerm || rf.killed() || (rf.currentTerm == args.Term && rf.votedFor != -1) {
-		DLogF(dVote, dDebug, rf.me, "Rejected to=%d, term=%d, isKilled=%v, alreadyVotedForterm=%v", args.CandidateId, args.Term, rf.killed(), rf.currentTerm == args.Term && rf.votedFor != -1)
+	if args.Term < rf.currentTerm || (rf.currentTerm == args.Term && rf.votedFor != -1) {
+		DLogF(dVote, dDebug, rf.me, "Rejected to=%d, term=%d, alreadyVotedForterm=%v", args.CandidateId, args.Term, rf.currentTerm == args.Term && rf.votedFor != -1)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
@@ -174,19 +168,16 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 
 		rf.votedFor = -1
-		if rf.state != Follower {
-			rf.state = Follower
-			rf.ResetElectionTime()
-		}
+		rf.state = Follower
+		rf.ResetElectionTime()
 	}
-
+	// what are the chances that election timeout goes out right in this patch? not many but still too many, thats why called resetElectionTimer
 	if rf.votedFor == -1 {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.ResetElectionTime()
 		DLogF(dVote, dDebug, rf.me, "Granted to:%d, for term:%d", rf.votedFor, rf.currentTerm)
-		return
 	} else {
 		DLogF(dVote, dDebug, rf.me, "Already voted for this term %d, to %d", args.Term, rf.votedFor)
 	}
@@ -254,20 +245,18 @@ func (rf *Raft) setCandidateState() {
 }
 
 func (rf *Raft) conductElection() {
-	if !rf.killed() && rf.state != Leader {
-		rf.mu.Lock()
+	rf.mu.Lock()
+	if rf.state != Leader {
 		if rf.electionCancel != nil {
-			DLogF(dElec, dDebug, rf.me, "Timeout for conductElection term=%d", rf.currentTerm)
+			DLogF(dElec, dDebug, rf.me, "Timeout when conducting election term=%d", rf.currentTerm)
 			rf.electionCancel()
 			rf.electionCancel = nil
 		}
-		ctx, cancel := context.WithCancel(context.Background())
-		rf.electionCtx = ctx
-		rf.electionCancel = cancel
-		if rf.state == Follower {
-			rf.setCandidateState()
-		}
+
+		rf.electionCtx, rf.electionCancel = context.WithTimeout(context.Background(), time.Duration(200*time.Millisecond))
 		rf.ResetElectionTime()
+
+		rf.setCandidateState()
 		myTerm := rf.currentTerm
 
 		args := &RequestVoteArgs{
@@ -313,6 +302,8 @@ func (rf *Raft) conductElection() {
 					rf.ResetElectionTime()
 				}
 				rf.mu.Unlock()
+				//Although you wont be getting votes just settings this to 1 so as to remove funny business
+				votesGranted = 1
 				break
 			}
 		}
@@ -320,12 +311,19 @@ func (rf *Raft) conductElection() {
 		defer rf.mu.Unlock()
 		if votesGranted > len(rf.peers)/2 && rf.state == Candidate {
 			DLogF(dElec, dDebug, rf.me, "Election won...")
+			rf.electionCancel = nil
 			rf.setLeaderState()
 			rf.ResetElectionTime()
 			go rf.broadcastHeartbeat()
+			return
 		} else {
+			rf.electionCancel = nil
 			DLogF(dElec, dDebug, rf.me, "Election lost...state=%v,votesG=%d", rf.state, votesGranted)
+			return
 		}
+	} else {
+		rf.mu.Unlock()
+		DLogF(dLog, dDebug, rf.me, "Election timeout popped for leader")
 	}
 }
 
@@ -352,7 +350,6 @@ func (rf *Raft) broadcastHeartbeat() {
 
 func (rf *Raft) setLeaderState() {
 	rf.state = Leader
-	rf.heartbeatTicker = time.NewTicker(getHeartbeattimer())
 	// start heartbeattimer?
 }
 
@@ -429,7 +426,6 @@ func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	rf.mu.Lock()
 	rf.state = Follower
-	rf.heartbeatTicker.Stop()
 	rf.mu.Unlock()
 }
 
@@ -439,7 +435,7 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for !rf.killed() {
+	for {
 		select {
 		case <-rf.electionTimer.C:
 			rf.mu.Lock()

@@ -25,7 +25,7 @@ type logTopic string
 type logLevel string
 
 var debugVerbosity int
-var debugStart time.Time
+var DebugStart time.Time
 
 // Debugging
 const Debug = false
@@ -33,7 +33,7 @@ const Info = true
 
 func init() {
 	debugVerbosity = getVerbosity()
-	debugStart = time.Now()
+	DebugStart = time.Now()
 	log.SetFlags(log.Flags() &^ (log.Ldate | log.Ltime))
 }
 
@@ -51,7 +51,7 @@ func DLogF(topic logTopic, logLevel logLevel, peerId int, format string, a ...in
 		return
 	}
 
-	time := time.Since(debugStart).Milliseconds()
+	time := time.Since(DebugStart).Milliseconds()
 	time /= 100
 	prefix := fmt.Sprintf("%06d [S%d] [%s] [%s] ", time, peerId, logLevel, string(topic))
 	format = prefix + format
