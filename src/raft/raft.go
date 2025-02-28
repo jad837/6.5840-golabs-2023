@@ -435,17 +435,13 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) ticker() {
-	for {
+	for !rf.killed() {
 		select {
 		case <-rf.electionTimer.C:
-			rf.mu.Lock()
-			if !rf.killed() {
-				go rf.conductElection()
-			}
-			rf.mu.Unlock()
+			go rf.conductElection()
 		case <-rf.heartbeatTicker.C:
 			rf.mu.Lock()
-			if !rf.killed() && rf.state == Leader {
+			if rf.state == Leader {
 				go rf.broadcastHeartbeat()
 			}
 			rf.mu.Unlock()
