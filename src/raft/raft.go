@@ -141,25 +141,22 @@ func (rf *Raft) setFollowerState(term int, votedFor int) {
 	rf.currentTerm = term
 }
 
+func (rf *Raft) isLogUptodate(candidateTerm int, candidateIndex int) bool {
+	return rf.GetLastLogIndex() <= candidateIndex && rf.GetLastLogTerm() <= candidateTerm
+}
+
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	// TODO's add log mismatch, before voting
-	if args.Term == rf.currentTerm && rf.votedFor == args.CandidateId {
-		DLogF(dVote, dDebug, rf.me, "Granted vote again for this term %d, to %d", args.Term, rf.votedFor)
-		reply.VoteGranted, reply.Term = true, rf.currentTerm
-		return
-	}
-
-	if args.Term < rf.currentTerm || (rf.currentTerm == args.Term && rf.votedFor != -1) {
+	if args.Term < rf.currentTerm {
 		DLogF(dVote, dDebug, rf.me, "Rejected to=%d, term=%d, alreadyVotedForterm=%v", args.CandidateId, args.Term, rf.currentTerm == args.Term && rf.votedFor != -1)
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = false
 		return
 	}
-
 	if args.Term > rf.currentTerm {
 		DLogF(dVote, dDebug, rf.me, "Higher term found, perhaps new leader leadterm=%d, myterm=%d", args.Term, rf.currentTerm)
 		rf.currentTerm = args.Term
@@ -169,14 +166,17 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.ResetElectionTime()
 	}
 	// what are the chances that election timeout goes out right in this patch? not many but still too many, thats why called resetElectionTimer
-	if rf.votedFor == -1 {
+	if !rf.isLogUptodate(args.LastLogTerm, args.LastLogIndex) {
+		DLogF(dVote, dDebug, rf.me, "Log is not uptodate comparedto:%d", args.CandidateId)
+	}
+	if (rf.votedFor == -1 || rf.votedFor == args.CandidateId) && rf.isLogUptodate(args.LastLogTerm, args.LastLogIndex) {
 		reply.Term = rf.currentTerm
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
 		rf.ResetElectionTime()
 		DLogF(dVote, dDebug, rf.me, "Granted to:%d, for term:%d", rf.votedFor, rf.currentTerm)
 	} else {
-		DLogF(dVote, dDebug, rf.me, "Already voted for this term %d, to %d", args.Term, rf.votedFor)
+		DLogF(dVote, dDebug, rf.me, "Vote denied for term %d, to %d, alreadyVoted:%d", args.Term, args.CandidateId, rf.votedFor)
 	}
 }
 
