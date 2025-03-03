@@ -20,7 +20,6 @@ package raft
 import (
 	//	"bytes"
 
-	"context"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -78,8 +77,6 @@ type Raft struct {
 	// timers
 	electionTimer   *time.Timer
 	heartbeatTicker *time.Ticker
-	electionCancel  context.CancelFunc
-	electionCtx     context.Context
 }
 
 // return currentTerm and whether this server
@@ -247,13 +244,6 @@ func (rf *Raft) setCandidateState() {
 func (rf *Raft) conductElection() {
 	rf.mu.Lock()
 	if rf.state != Leader {
-		if rf.electionCancel != nil {
-			DLogF(dElec, dDebug, rf.me, "Timeout when conducting election term=%d", rf.currentTerm)
-			rf.electionCancel()
-			rf.electionCancel = nil
-		}
-
-		rf.electionCtx, rf.electionCancel = context.WithTimeout(context.Background(), time.Duration(200*time.Millisecond))
 		rf.ResetElectionTime()
 
 		rf.setCandidateState()
@@ -265,16 +255,13 @@ func (rf *Raft) conductElection() {
 		}
 		rf.mu.Unlock()
 
-		resultChan := make(chan *RequestVoteReply, len(rf.peers)-1)
-		var wg sync.WaitGroup
+		resultChan := make(chan *RequestVoteReply)
 		// ask for votes using goroutine
 		for server := range rf.peers {
 			if server == rf.me {
 				continue
 			}
-			wg.Add(1)
-			go func(server int) {
-				defer wg.Done()
+			go func(server int, resultChan chan *RequestVoteReply) {
 				reply := RequestVoteReply{}
 				ok := rf.sendRequestVote(server, args, &reply)
 				if !ok {
@@ -282,15 +269,16 @@ func (rf *Raft) conductElection() {
 					reply.Term = -1
 				}
 				resultChan <- &reply
-			}(server)
+			}(server, resultChan)
 		}
-		wg.Wait()
-		close(resultChan)
 		//self voting
 
 		votesGranted := 1
-
-		for result := range resultChan {
+		votesReceived := 1
+		for {
+			result := <-resultChan
+			DLogF(dLeader, dDebug, rf.me, "received from channel %v", result)
+			votesReceived++
 			if result.VoteGranted {
 				votesGranted++
 			} else if result.Term > args.Term {
@@ -302,8 +290,9 @@ func (rf *Raft) conductElection() {
 					rf.ResetElectionTime()
 				}
 				rf.mu.Unlock()
-				//Although you wont be getting votes just settings this to 1 so as to remove funny business
-				votesGranted = 1
+				break
+			}
+			if votesReceived == len(rf.peers) || votesGranted > len(rf.peers)/2 {
 				break
 			}
 		}
@@ -311,13 +300,11 @@ func (rf *Raft) conductElection() {
 		defer rf.mu.Unlock()
 		if votesGranted > len(rf.peers)/2 && rf.state == Candidate {
 			DLogF(dElec, dDebug, rf.me, "Election won...")
-			rf.electionCancel = nil
 			rf.setLeaderState()
 			rf.ResetElectionTime()
 			go rf.broadcastHeartbeat()
 			return
 		} else {
-			rf.electionCancel = nil
 			DLogF(dElec, dDebug, rf.me, "Election lost...state=%v,votesG=%d", rf.state, votesGranted)
 			return
 		}
