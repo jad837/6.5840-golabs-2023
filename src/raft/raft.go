@@ -201,10 +201,10 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	if args.Term < rf.currentTerm {
 		DLogF(dLog, dDebug, rf.me, "Rejecting AppendEntries from=%d", args.LeaderId)
-		reply.Term = rf.currentTerm
-		reply.Success = false
+		reply.Term, reply.Success = rf.currentTerm, false
 		return
 	}
+
 	reply.Term = args.Term
 	if args.Term > rf.currentTerm {
 		// I am lagging as leader so I should abandone being leader
@@ -213,6 +213,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.votedFor = -1
 	}
 	rf.state = Follower
+
 	if len(args.Entries) == 0 {
 		// empty log Heartbeat
 		DLogF(dHtbt, dDebug, rf.me, "Received from=%d", args.LeaderId)
@@ -221,6 +222,43 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.ResetElectionTime()
 		return
 	}
+
+	conflictIndex := -1
+	if (args.PrevLogIndex >= rf.GetLastLogIndex()) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		// reply as false, Log mismatch case
+		if args.PrevLogIndex >= rf.GetLastLogIndex() {
+			DLogF(dLog, dDebug, rf.me, "Log mismatch, args.PrevLogIndex: %d, GetPrevLogIndex: %d, conflictIndex:%d", args.PrevLogIndex, rf.GetLastLogIndex(), conflictIndex)
+			conflictIndex = rf.GetLastLogIndex() + 1
+		} else {
+			// go through all the logs till committed ones
+			conflictIndex = args.PrevLogIndex
+			conflictTerm := args.PrevLogTerm
+			for conflictIndex > -1 && rf.log[conflictIndex].Term == conflictTerm {
+				conflictIndex--
+			}
+			DLogF(dLog, dDebug, rf.me, "Log mismatch, args.PrevLogTerm: %d, GetPrevLogTerm: %d, conflictIndex: %d, conflictTerm:%d", args.PrevLogTerm, rf.GetLastLogTerm(), conflictIndex, conflictTerm)
+
+		}
+		reply.Success = false
+		// find the conflictingIndex
+		reply.ConflictIndex = conflictIndex
+		return
+	}
+
+	if args.PrevLogIndex > -1 && args.PrevLogIndex < rf.GetLastLogIndex() {
+		// conflict before last log reconcile logs
+		rf.log = rf.log[:args.PrevLogIndex+1]
+		DLogF(dLog, dDebug, rf.me, "Removing conflicting entries {prevLogIndex: %d, lastLogIndex:%d}", args.PrevLogIndex, rf.GetLastLogIndex())
+		// removed the issue entries
+	}
+	//appended new entries
+	rf.log = append(rf.log, args.Entries...)
+	rf.commitIndex = min(rf.commitIndex, min(args.LeaderCommit, rf.GetLastLogIndex()))
+	reply.Success = true
+	reply.ConflictIndex = -1
+	reply.Term = rf.currentTerm
+	//TODO's Call applyMessages coroutine
+
 }
 
 func (rf *Raft) GetLastLogTerm() int {
