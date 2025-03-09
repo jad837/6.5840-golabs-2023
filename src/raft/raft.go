@@ -352,6 +352,53 @@ func (rf *Raft) conductElection() {
 	}
 }
 
+func (rf *Raft) broadcastLogEntries() {
+	// calculate log entries to send using nextIndex and matchIndex.
+	// use the reply gotten from the peer to update nextIndex, matchIndex & commitIndex/lastApplied
+	rf.mu.Lock()
+	args := &AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		LeaderCommit: rf.commitIndex,
+	}
+	rf.mu.Unlock()
+	DLogF(dLog, dDebug, rf.me, "Send Logs")
+	for server := range rf.peers {
+		if server == rf.me {
+			continue
+		}
+		prevLogIndex := rf.nextIndex[server]
+		prevLogTerm := rf.log[prevLogIndex].Term
+		peerArgs := &AppendEntriesArgs{
+			LeaderId:     args.LeaderId,
+			Term:         args.Term,
+			LeaderCommit: args.LeaderCommit,
+			PrevLogIndex: prevLogIndex,
+			PrevLogTerm:  prevLogTerm,
+			Entries:      rf.log[prevLogIndex+1:],
+		}
+		if len(peerArgs.Entries) == 0 {
+			DLogF(dLog, dDebug, rf.me, "No log broadcasting to peer %d", server)
+		}
+
+		go func(server int) {
+			reply := AppendEntriesReply{}
+			reply.PeerId = server
+			ok := rf.sendAppendEntries(server, peerArgs, &reply)
+			if !ok {
+				DLogF(dLog, dError, rf.me, "Critical AppendEntries failed to peer %d", server)
+				reply.Success = false
+				reply.ConflictIndex = peerArgs.PrevLogIndex
+				reply.Term = args.Term
+			}
+			rf.mu.Lock()
+			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries)
+			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries) - 1
+			rf.mu.Unlock()
+		}(server)
+	}
+}
+
 func (rf *Raft) broadcastHeartbeat() {
 	rf.mu.Lock()
 	logs := make([]LogEntry, 0)

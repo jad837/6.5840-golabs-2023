@@ -23,6 +23,7 @@ type AppendEntriesReply struct {
 	Term          int
 	Success       bool
 	ConflictIndex int
+	PeerId        int
 }
 
 // example RequestVote RPC arguments structure.
