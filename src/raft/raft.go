@@ -77,6 +77,8 @@ type Raft struct {
 	// timers
 	electionTimer   *time.Timer
 	heartbeatTicker *time.Ticker
+
+	applyChannel chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -150,7 +152,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	// TODO's add log mismatch, before voting
 	if args.Term < rf.currentTerm {
 		DLogF(dVote, dDebug, rf.me, "Rejected to=%d, term=%d, alreadyVotedForterm=%v", args.CandidateId, args.Term, rf.currentTerm == args.Term && rf.votedFor != -1)
 		reply.Term = rf.currentTerm
@@ -224,41 +225,46 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 
 	conflictIndex := -1
-	if (args.PrevLogIndex >= rf.GetLastLogIndex()) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		// reply as false, Log mismatch case
-		if args.PrevLogIndex >= rf.GetLastLogIndex() {
-			DLogF(dLog, dDebug, rf.me, "Log mismatch, args.PrevLogIndex: %d, GetPrevLogIndex: %d, conflictIndex:%d", args.PrevLogIndex, rf.GetLastLogIndex(), conflictIndex)
-			conflictIndex = rf.GetLastLogIndex() + 1
-		} else {
-			// go through all the logs till committed ones
-			conflictIndex = args.PrevLogIndex
-			conflictTerm := args.PrevLogTerm
-			for conflictIndex > -1 && rf.log[conflictIndex].Term == conflictTerm {
-				conflictIndex--
+	if args.PrevLogIndex > -1 {
+		DLogF(dLog, dDebug, rf.me, "PrevLogIndex is big enough %d", args.PrevLogIndex)
+		if (args.PrevLogIndex >= rf.GetLastLogIndex()) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+			// reply as false, Log mismatch case
+			if args.PrevLogIndex >= rf.GetLastLogIndex() {
+				DLogF(dLog, dDebug, rf.me, "Log mismatch, args.PrevLogIndex: %d, GetPrevLogIndex: %d, conflictIndex:%d", args.PrevLogIndex, rf.GetLastLogIndex(), conflictIndex)
+				conflictIndex = rf.GetLastLogIndex() + 1
+			} else {
+				// go through all the logs till committed ones
+				conflictIndex = args.PrevLogIndex
+				conflictTerm := args.PrevLogTerm
+				for conflictIndex > -1 && rf.log[conflictIndex].Term == conflictTerm {
+					conflictIndex--
+				}
+				DLogF(dLog, dDebug, rf.me, "Log mismatch, args.PrevLogTerm: %d, GetPrevLogTerm: %d, conflictIndex: %d, conflictTerm:%d", args.PrevLogTerm, rf.GetLastLogTerm(), conflictIndex, conflictTerm)
+
 			}
-			DLogF(dLog, dDebug, rf.me, "Log mismatch, args.PrevLogTerm: %d, GetPrevLogTerm: %d, conflictIndex: %d, conflictTerm:%d", args.PrevLogTerm, rf.GetLastLogTerm(), conflictIndex, conflictTerm)
-
+			reply.Success = false
+			// find the conflictingIndex
+			reply.ConflictIndex = conflictIndex
+			return
 		}
-		reply.Success = false
-		// find the conflictingIndex
-		reply.ConflictIndex = conflictIndex
-		return
+
+		if args.PrevLogIndex < rf.GetLastLogIndex() {
+			// conflict before last log reconcile logs
+			rf.log = rf.log[:args.PrevLogIndex+1]
+			DLogF(dLog, dDebug, rf.me, "Removing conflicting entries {prevLogIndex: %d, lastLogIndex:%d}", args.PrevLogIndex, rf.GetLastLogIndex())
+			// removed the issue entries
+		}
 	}
 
-	if args.PrevLogIndex > -1 && args.PrevLogIndex < rf.GetLastLogIndex() {
-		// conflict before last log reconcile logs
-		rf.log = rf.log[:args.PrevLogIndex+1]
-		DLogF(dLog, dDebug, rf.me, "Removing conflicting entries {prevLogIndex: %d, lastLogIndex:%d}", args.PrevLogIndex, rf.GetLastLogIndex())
-		// removed the issue entries
-	}
 	//appended new entries
 	rf.log = append(rf.log, args.Entries...)
 	rf.commitIndex = min(rf.commitIndex, min(args.LeaderCommit, rf.GetLastLogIndex()))
 	reply.Success = true
 	reply.ConflictIndex = -1
 	reply.Term = rf.currentTerm
+	DLogF(dLog, dDebug, rf.me, "Success for logs from leader :%d, commitIndex:%d", args.LeaderId, rf.commitIndex)
 	//TODO's Call applyMessages coroutine
-
+	go rf.applyLog()
 }
 
 func (rf *Raft) GetLastLogTerm() int {
@@ -361,22 +367,30 @@ func (rf *Raft) broadcastLogEntries() {
 		LeaderId:     rf.me,
 		LeaderCommit: rf.commitIndex,
 	}
+	entries := make([]LogEntry, len(rf.log))
+	copy(entries, rf.log)
 	rf.mu.Unlock()
-	DLogF(dLog, dDebug, rf.me, "Send Logs")
+	DLogF(dLog, dDebug, rf.me, "Send Logs %v", entries)
 	for server := range rf.peers {
 		if server == rf.me {
 			continue
 		}
-		prevLogIndex := rf.nextIndex[server]
-		prevLogTerm := rf.log[prevLogIndex].Term
+		prevLogIndex := rf.nextIndex[server] - 1
+		prevLogTerm := 0
+		if prevLogIndex != -1 {
+			DLogF(dLog, dDebug, rf.me, "PrevLogIndex is %d", prevLogIndex)
+			prevLogTerm = rf.log[prevLogIndex].Term
+			entries = rf.log[prevLogIndex+1:]
+		}
 		peerArgs := &AppendEntriesArgs{
 			LeaderId:     args.LeaderId,
 			Term:         args.Term,
 			LeaderCommit: args.LeaderCommit,
 			PrevLogIndex: prevLogIndex,
 			PrevLogTerm:  prevLogTerm,
-			Entries:      rf.log[prevLogIndex+1:],
+			Entries:      entries,
 		}
+		DLogF(dLog, dDebug, rf.me, "AppendEntriesArgs:%v", peerArgs)
 		if len(peerArgs.Entries) == 0 {
 			DLogF(dLog, dDebug, rf.me, "No log broadcasting to peer %d", server)
 		}
@@ -391,12 +405,53 @@ func (rf *Raft) broadcastLogEntries() {
 				reply.ConflictIndex = peerArgs.PrevLogIndex
 				reply.Term = args.Term
 			}
-			rf.mu.Lock()
-			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries)
-			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries) - 1
-			rf.mu.Unlock()
+			if reply.Success {
+				DLogF(dLog, dDebug, rf.me, "Successful log entry to peer")
+				rf.mu.Lock()
+				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries)
+				rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries) - 1
+				rf.mu.Unlock()
+				if rf.lastApplied > rf.matchIndex[server] && rf.commitIndex < rf.matchIndex[server] && rf.log[rf.matchIndex[server]].Term == rf.currentTerm {
+					totalPeers := len(rf.peers)
+					updatedPeers := 0
+					maxCommitableIndex := rf.commitIndex
+					for i := rf.commitIndex; i < rf.lastApplied; i++ {
+						updatedPeers = 0
+						for peer := range rf.peers {
+							if rf.matchIndex[peer] >= i {
+								updatedPeers++
+							}
+						}
+						if updatedPeers > totalPeers/2 {
+							// majority has updated logs
+							DLogF(dLog, dDebug, rf.me, "Log has majority {term:%d, index:%d}", rf.currentTerm, i)
+							maxCommitableIndex = i
+						} else {
+							break
+						}
+					}
+					rf.mu.Lock()
+					rf.commitIndex = maxCommitableIndex
+					rf.mu.Unlock()
+					go rf.applyLog()
+				}
+
+			}
 		}(server)
 	}
+}
+
+func (rf *Raft) applyLog() {
+	rf.mu.Lock()
+	for rf.commitIndex > rf.lastApplied {
+		DLogF(dApplyMsg, dDebug, rf.me, "Applying msg %d", rf.lastApplied+1)
+		rf.lastApplied++
+		rf.applyChannel <- ApplyMsg{
+			Command:      rf.log[rf.lastApplied],
+			CommandIndex: rf.lastApplied,
+		}
+	}
+	rf.mu.Unlock()
 }
 
 func (rf *Raft) broadcastHeartbeat() {
@@ -423,6 +478,18 @@ func (rf *Raft) broadcastHeartbeat() {
 func (rf *Raft) setLeaderState() {
 	rf.state = Leader
 	// start heartbeattimer?
+	// reset indexes
+	rf.initializeNextAndMatch()
+}
+
+func (rf *Raft) initializeNextAndMatch() {
+	for i := 0; i < len(rf.peers); i++ {
+		if i == rf.me {
+			continue
+		}
+		rf.matchIndex[i] = 0
+		rf.nextIndex[i] = len(rf.log)
+	}
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -476,11 +543,17 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
-	term := -1
-	isLeader := true
-
+	term := 0
+	isLeader := false
+	term, isLeader = rf.GetState()
 	// Your code here (2B).
-
+	if isLeader {
+		DLogF(dApplyMsg, dDebug, rf.me, "Command Received %v %v", command, len(rf.log))
+		entry := LogEntry{Command: command, Term: term}
+		rf.log = append(rf.log, entry)
+		index = len(rf.log) - 1
+		go rf.broadcastLogEntries()
+	}
 	return index, term, isLeader
 }
 
@@ -540,7 +613,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.electionTimer = time.NewTimer(getRandomizedElectionTimer())
 	rf.setFollowerState(1, -1)
 	rf.log = make([]LogEntry, 0)
-
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.applyChannel = applyCh
+	rf.lastApplied = -1
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash

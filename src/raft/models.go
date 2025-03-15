@@ -19,6 +19,20 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
+func (ae *AppendEntriesArgs) String() string {
+	entriesStr := "["
+	for i, entry := range ae.Entries {
+		entriesStr += entry.String()
+		if i < len(ae.Entries)-1 {
+			entriesStr += ", "
+		}
+	}
+	entriesStr += "]"
+
+	return fmt.Sprintf("{Term: %d, LeaderId: %d, PrevLogIndex: %d, PrevLogTerm: %d, Entries: %s, LeaderCommit: %d}",
+		ae.Term, ae.LeaderId, ae.PrevLogIndex, ae.PrevLogTerm, entriesStr, ae.LeaderCommit)
+}
+
 type AppendEntriesReply struct {
 	Term          int
 	Success       bool
@@ -51,6 +65,10 @@ func (reply *RequestVoteReply) String() string {
 type LogEntry struct {
 	Command interface{}
 	Term    int
+}
+
+func (le *LogEntry) String() string {
+	return fmt.Sprintf("{Term: %d, Command: %+v}", le.Term, le.Command)
 }
 
 const (
