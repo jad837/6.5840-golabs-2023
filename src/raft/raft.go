@@ -213,6 +213,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
 	}
+	rf.commitIndex = min(rf.GetLastLogIndex(), args.LeaderCommit)
 	rf.state = Follower
 
 	if len(args.Entries) == 0 {
@@ -220,7 +221,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		DLogF(dHtbt, dDebug, rf.me, "Received from=%d", args.LeaderId)
 		reply.Term = rf.currentTerm
 		reply.Success = true
+		reply.LastLogIndex = rf.GetLastLogIndex()
+		reply.ConflictIndex = -1
+		reply.PeerId = rf.me
 		rf.ResetElectionTime()
+		go rf.applyLog()
 		return
 	}
 
@@ -245,6 +250,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			reply.Success = false
 			// find the conflictingIndex
 			reply.ConflictIndex = conflictIndex
+			reply.Term = rf.currentTerm
+			reply.LastLogIndex = rf.GetLastLogIndex()
 			return
 		}
 
@@ -262,6 +269,8 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	reply.ConflictIndex = -1
 	reply.Term = rf.currentTerm
+	reply.LastLogIndex = rf.GetLastLogIndex()
+	reply.PeerId = rf.me
 	DLogF(dLog, dDebug, rf.me, "Success for logs from leader :%d, commitIndex:%d", args.LeaderId, rf.commitIndex)
 	//TODO's Call applyMessages coroutine
 	go rf.applyLog()
@@ -275,7 +284,10 @@ func (rf *Raft) GetLastLogTerm() int {
 }
 
 func (rf *Raft) GetLastLogIndex() int {
-	return len(rf.log) - 1
+	if len(rf.log) == 0 {
+		return 0
+	}
+	return rf.log[len(rf.log)-1].Index
 }
 
 func (rf *Raft) setCandidateState() {
@@ -367,8 +379,8 @@ func (rf *Raft) broadcastLogEntries() {
 		LeaderId:     rf.me,
 		LeaderCommit: rf.commitIndex,
 	}
-	entries := make([]LogEntry, len(rf.log))
-	copy(entries, rf.log)
+	entries := make([]LogEntry, 0)
+	entries = append(entries, rf.log...)
 	rf.mu.Unlock()
 	DLogF(dLog, dDebug, rf.me, "Send Logs %v", entries)
 	for server := range rf.peers {
@@ -397,37 +409,42 @@ func (rf *Raft) broadcastLogEntries() {
 
 		go func(server int) {
 			reply := AppendEntriesReply{}
-			reply.PeerId = server
 			ok := rf.sendAppendEntries(server, peerArgs, &reply)
+			reply.PeerId = server
 			if !ok {
 				DLogF(dLog, dError, rf.me, "Critical AppendEntries failed to peer %d", server)
 				reply.Success = false
 				reply.ConflictIndex = peerArgs.PrevLogIndex
 				reply.Term = args.Term
+				reply.LastLogIndex = peerArgs.PrevLogIndex
 			}
 			if reply.Success {
 				DLogF(dLog, dDebug, rf.me, "Successful log entry to peer")
 				rf.mu.Lock()
-				rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries)
-				rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries) - 1
+				rf.nextIndex[server] = reply.LastLogIndex + 1
+				rf.matchIndex[server] = reply.LastLogIndex
 				rf.mu.Unlock()
-				if rf.lastApplied > rf.matchIndex[server] && rf.commitIndex < rf.matchIndex[server] && rf.log[rf.matchIndex[server]].Term == rf.currentTerm {
+				
+				DLogF(dLog, dDebug, rf.me, "Updated for peer %d, {matchIndex:%d, nextIndex:%d}", server, rf.matchIndex[server], rf.nextIndex[server])
+				DLogF(dLog, dDebug, rf.me, "Log majority check {term:%d, index:%d, commitIndex:%d, logTerm:%d}", rf.currentTerm, rf.matchIndex[server], rf.commitIndex, rf.log[].Term)
+				if rf.commitIndex < rf.matchIndex[server] && rf.log[rf.matchIndex[server]].Term == rf.currentTerm {
 					totalPeers := len(rf.peers)
 					updatedPeers := 0
 					maxCommitableIndex := rf.commitIndex
-					for i := rf.commitIndex; i < rf.lastApplied; i++ {
+					for i := rf.commitIndex; i <= rf.matchIndex[server]; i++ {
 						updatedPeers = 0
 						for peer := range rf.peers {
+							if rf.me == peer {
+								updatedPeers++
+							}
 							if rf.matchIndex[peer] >= i {
 								updatedPeers++
 							}
 						}
 						if updatedPeers > totalPeers/2 {
 							// majority has updated logs
-							DLogF(dLog, dDebug, rf.me, "Log has majority {term:%d, index:%d}", rf.currentTerm, i)
+							DLogF(dLog, dDebug, rf.me, "Log has majority, can commit {term:%d, index:%d}", rf.currentTerm, i)
 							maxCommitableIndex = i
-						} else {
-							break
 						}
 					}
 					rf.mu.Lock()
@@ -443,11 +460,13 @@ func (rf *Raft) broadcastLogEntries() {
 
 func (rf *Raft) applyLog() {
 	rf.mu.Lock()
+	DLogF(dCommit, dDebug, rf.me, "ApplyState:{lastApplied=%d, commit=%d}", rf.lastApplied, rf.commitIndex)
 	for rf.commitIndex > rf.lastApplied {
 		DLogF(dApplyMsg, dDebug, rf.me, "Applying msg %d", rf.lastApplied+1)
 		rf.lastApplied++
 		rf.applyChannel <- ApplyMsg{
-			Command:      rf.log[rf.lastApplied],
+			CommandValid: true,
+			Command:      rf.log[rf.lastApplied].Command,
 			CommandIndex: rf.lastApplied,
 		}
 	}
@@ -458,9 +477,10 @@ func (rf *Raft) broadcastHeartbeat() {
 	rf.mu.Lock()
 	logs := make([]LogEntry, 0)
 	args := &AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-		Entries:  logs,
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		Entries:      logs,
+		LeaderCommit: rf.commitIndex,
 	}
 	rf.mu.Unlock()
 	DLogF(dHtbt, dDebug, rf.me, "Sent htbt")
@@ -488,7 +508,7 @@ func (rf *Raft) initializeNextAndMatch() {
 			continue
 		}
 		rf.matchIndex[i] = 0
-		rf.nextIndex[i] = len(rf.log)
+		rf.nextIndex[i] = rf.GetLastLogIndex()
 	}
 }
 
@@ -549,9 +569,11 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	// Your code here (2B).
 	if isLeader {
 		DLogF(dApplyMsg, dDebug, rf.me, "Command Received %v %v", command, len(rf.log))
-		entry := LogEntry{Command: command, Term: term}
+		rf.mu.Lock()
+		entry := LogEntry{Command: command, Term: term, Index: rf.GetLastLogIndex() + 1}
 		rf.log = append(rf.log, entry)
-		index = len(rf.log) - 1
+		index = rf.GetLastLogIndex()
+		rf.mu.Unlock()
 		go rf.broadcastLogEntries()
 	}
 	return index, term, isLeader
@@ -616,7 +638,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.applyChannel = applyCh
-	rf.lastApplied = -1
+
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash

@@ -38,6 +38,7 @@ type AppendEntriesReply struct {
 	Success       bool
 	ConflictIndex int
 	PeerId        int
+	LastLogIndex  int
 }
 
 // example RequestVote RPC arguments structure.
@@ -65,10 +66,11 @@ func (reply *RequestVoteReply) String() string {
 type LogEntry struct {
 	Command interface{}
 	Term    int
+	Index   int
 }
 
 func (le *LogEntry) String() string {
-	return fmt.Sprintf("{Term: %d, Command: %+v}", le.Term, le.Command)
+	return fmt.Sprintf("{Term: %d, Command: %+v, Index:%d}", le.Term, le.Command, le.Index)
 }
 
 const (
