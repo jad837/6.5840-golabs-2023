@@ -200,6 +200,7 @@ func (rf *Raft) ResetElectionTime() {
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	DLogF(dLog, dTrace, rf.me, "AppendEntries received :%v", args)
 	if args.Term < rf.currentTerm {
 		DLogF(dLog, dDebug, rf.me, "Rejecting AppendEntries from=%d", args.LeaderId)
 		reply.Term, reply.Success = rf.currentTerm, false
@@ -228,43 +229,44 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		go rf.applyLog()
 		return
 	}
-
-	conflictIndex := -1
-	if args.PrevLogIndex > -1 {
-		DLogF(dLog, dDebug, rf.me, "PrevLogIndex is big enough %d", args.PrevLogIndex)
-		if (args.PrevLogIndex >= rf.GetLastLogIndex()) || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-			// reply as false, Log mismatch case
-			if args.PrevLogIndex >= rf.GetLastLogIndex() {
-				DLogF(dLog, dDebug, rf.me, "Log mismatch, args.PrevLogIndex: %d, GetPrevLogIndex: %d, conflictIndex:%d", args.PrevLogIndex, rf.GetLastLogIndex(), conflictIndex)
-				conflictIndex = rf.GetLastLogIndex() + 1
-			} else {
-				// go through all the logs till committed ones
-				conflictIndex = args.PrevLogIndex
-				conflictTerm := args.PrevLogTerm
-				for conflictIndex > -1 && rf.log[conflictIndex].Term == conflictTerm {
-					conflictIndex--
-				}
-				DLogF(dLog, dDebug, rf.me, "Log mismatch, args.PrevLogTerm: %d, GetPrevLogTerm: %d, conflictIndex: %d, conflictTerm:%d", args.PrevLogTerm, rf.GetLastLogTerm(), conflictIndex, conflictTerm)
-
+	/*
+		// if my GetLastLogIndex = 0 when no logs are there.
+		if this is anything its painful because of how bad I have written this.
+		if my PrevLogIndex = 1 then my GetLastLogIndex can be equal to 0
+		How do you solve this shit problem?
+	*/
+	if args.PrevLogIndex > rf.GetLastLogIndex() {
+		// prevLogIndex is not included in my rf.log
+		// prevLogIndex is greater means my logIndex should be the lastLogIndex for this whole sham
+		DLogF(dLog, dDebug, rf.me, "PrevLogIndex is too high, conflict index will be my last log")
+		reply.Success = false
+		reply.ConflictIndex = rf.GetLastLogIndex()
+		return
+	}
+	if args.PrevLogIndex != 0 && args.PrevLogIndex <= rf.GetLastLogIndex() {
+		// now I can match the index and term
+		DLogF(dLog, dDebug, rf.me, "Checking log mismatch")
+		if rf.log[args.PrevLogIndex-1].Term != rf.log[rf.GetLastLogIndex()-1].Term {
+			conflictIndex := args.PrevLogIndex
+			conflictTerm := rf.log[conflictIndex].Term
+			for conflictIndex > 0 && rf.log[conflictIndex].Term == conflictTerm {
+				conflictIndex--
 			}
+			DLogF(dLog, dDebug, rf.me, "MismatchIndex: %d, MismatchTerm: %d", conflictIndex, conflictTerm)
 			reply.Success = false
-			// find the conflictingIndex
 			reply.ConflictIndex = conflictIndex
-			reply.Term = rf.currentTerm
-			reply.LastLogIndex = rf.GetLastLogIndex()
 			return
 		}
+	}
 
-		if args.PrevLogIndex < rf.GetLastLogIndex() {
-			// conflict before last log reconcile logs
-			rf.log = rf.log[:args.PrevLogIndex+1]
-			DLogF(dLog, dDebug, rf.me, "Removing conflicting entries {prevLogIndex: %d, lastLogIndex:%d}", args.PrevLogIndex, rf.GetLastLogIndex())
-			// removed the issue entries
-		}
+	if args.PrevLogIndex != 0 && args.PrevLogIndex < rf.GetLastLogIndex() {
+		DLogF(dLog, dDebug, rf.me, "Removing conflicting entries {prevLogIndex: %d, lastLogIndex:%d}", args.PrevLogIndex, rf.GetLastLogIndex())
+		rf.log = rf.log[:args.PrevLogIndex+1]
 	}
 
 	//appended new entries
 	rf.log = append(rf.log, args.Entries...)
+	DLogF(dLog, dDebug, rf.me, "Entries added %v", rf.log)
 	rf.commitIndex = min(rf.commitIndex, min(args.LeaderCommit, rf.GetLastLogIndex()))
 	reply.Success = true
 	reply.ConflictIndex = -1
@@ -317,9 +319,22 @@ func (rf *Raft) conductElection() {
 			if server == rf.me {
 				continue
 			}
+			rf.mu.Lock()
+			lastLogIndex := rf.matchIndex[server]
+			lastLogTerm := 0
+			if lastLogIndex != 0 {
+				lastLogTerm = rf.log[lastLogIndex].Term
+			}
+			rf.mu.Unlock()
+			peerArgs := &RequestVoteArgs{
+				Term:         args.Term,
+				CandidateId:  args.CandidateId,
+				LastLogIndex: lastLogIndex,
+				LastLogTerm:  lastLogTerm,
+			}
 			go func(server int, resultChan chan *RequestVoteReply) {
 				reply := RequestVoteReply{}
-				ok := rf.sendRequestVote(server, args, &reply)
+				ok := rf.sendRequestVote(server, peerArgs, &reply)
 				if !ok {
 					reply.VoteGranted = false
 					reply.Term = -1
@@ -347,6 +362,8 @@ func (rf *Raft) conductElection() {
 				}
 				rf.mu.Unlock()
 				break
+			} else {
+				DLogF(dElec, dDebug, rf.me, "Didnt receive")
 			}
 			if votesReceived == len(rf.peers) || votesGranted > len(rf.peers)/2 {
 				break
@@ -370,6 +387,61 @@ func (rf *Raft) conductElection() {
 	}
 }
 
+func (rf *Raft) sendAppendEntryToPeer(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	ok := rf.sendAppendEntries(server, args, reply)
+	reply.PeerId = server
+	if !ok {
+		DLogF(dLog, dError, rf.me, "Critical AppendEntries failed to peer %d", server)
+		reply.Success = false
+		reply.ConflictIndex = args.PrevLogIndex
+		reply.Term = args.Term
+		reply.LastLogIndex = args.PrevLogIndex
+	}
+	if reply.Success {
+		DLogF(dLog, dDebug, rf.me, "Successful log entry to peer, reply.LastLogIndex %d", reply.LastLogIndex)
+		rf.mu.Lock()
+		rf.nextIndex[server] = reply.LastLogIndex + 1
+		rf.matchIndex[server] = reply.LastLogIndex
+		rf.mu.Unlock()
+
+		DLogF(dLog, dDebug, rf.me, "Updated for peer %d, {matchIndex:%d, nextIndex:%d}", server, rf.matchIndex[server], rf.nextIndex[server])
+		DLogF(dLog, dDebug, rf.me, "Log majority check {term:%d, index:%d, commitIndex:%d, logTerm:%d}", rf.currentTerm, rf.matchIndex[server], rf.commitIndex, rf.log[len(rf.log)-1].Term)
+		if rf.commitIndex < rf.matchIndex[server] && rf.log[rf.matchIndex[server]-1].Term == rf.currentTerm {
+			totalPeers := len(rf.peers)
+			updatedPeers := 0
+			maxCommitableIndex := rf.commitIndex
+			for i := rf.commitIndex; i <= rf.matchIndex[server]; i++ {
+				updatedPeers = 0
+				for peer := range rf.peers {
+					if rf.me == peer || rf.matchIndex[peer] >= i {
+						updatedPeers++
+					}
+				}
+				if updatedPeers > totalPeers/2 {
+					// majority has updated logs
+					DLogF(dLog, dDebug, rf.me, "Log has majority, can commit {term:%d, index:%d}", rf.currentTerm, i)
+					maxCommitableIndex = i
+				}
+			}
+			rf.mu.Lock()
+			rf.commitIndex = maxCommitableIndex
+			rf.mu.Unlock()
+			go rf.applyLog()
+		}
+
+	} else {
+		DLogF(dLog, dError, rf.me, "AppendEntries.Reply.Failed %v", reply)
+		// retry
+		rf.mu.Lock()
+		rf.nextIndex[reply.PeerId] = reply.ConflictIndex
+		rf.mu.Unlock()
+		args.PrevLogIndex = rf.nextIndex[reply.PeerId]
+		args.PrevLogTerm = rf.log[args.PrevLogIndex].Term
+		rf.sendAppendEntryToPeer(server, args, reply)
+
+	}
+}
+
 func (rf *Raft) broadcastLogEntries() {
 	// calculate log entries to send using nextIndex and matchIndex.
 	// use the reply gotten from the peer to update nextIndex, matchIndex & commitIndex/lastApplied
@@ -387,13 +459,15 @@ func (rf *Raft) broadcastLogEntries() {
 		if server == rf.me {
 			continue
 		}
-		prevLogIndex := rf.nextIndex[server] - 1
+		rf.mu.Lock()
+		prevLogIndex := max(rf.nextIndex[server], 0)
 		prevLogTerm := 0
-		if prevLogIndex != -1 {
+		if prevLogIndex != 0 {
 			DLogF(dLog, dDebug, rf.me, "PrevLogIndex is %d", prevLogIndex)
-			prevLogTerm = rf.log[prevLogIndex].Term
-			entries = rf.log[prevLogIndex+1:]
+			prevLogTerm = rf.log[prevLogIndex-1].Term
+			entries = rf.log[prevLogIndex-1:]
 		}
+		rf.mu.Unlock()
 		peerArgs := &AppendEntriesArgs{
 			LeaderId:     args.LeaderId,
 			Term:         args.Term,
@@ -406,67 +480,19 @@ func (rf *Raft) broadcastLogEntries() {
 		if len(peerArgs.Entries) == 0 {
 			DLogF(dLog, dDebug, rf.me, "No log broadcasting to peer %d", server)
 		}
-
-		go func(server int) {
-			reply := AppendEntriesReply{}
-			ok := rf.sendAppendEntries(server, peerArgs, &reply)
-			reply.PeerId = server
-			if !ok {
-				DLogF(dLog, dError, rf.me, "Critical AppendEntries failed to peer %d", server)
-				reply.Success = false
-				reply.ConflictIndex = peerArgs.PrevLogIndex
-				reply.Term = args.Term
-				reply.LastLogIndex = peerArgs.PrevLogIndex
-			}
-			if reply.Success {
-				DLogF(dLog, dDebug, rf.me, "Successful log entry to peer")
-				rf.mu.Lock()
-				rf.nextIndex[server] = reply.LastLogIndex + 1
-				rf.matchIndex[server] = reply.LastLogIndex
-				rf.mu.Unlock()
-				
-				DLogF(dLog, dDebug, rf.me, "Updated for peer %d, {matchIndex:%d, nextIndex:%d}", server, rf.matchIndex[server], rf.nextIndex[server])
-				DLogF(dLog, dDebug, rf.me, "Log majority check {term:%d, index:%d, commitIndex:%d, logTerm:%d}", rf.currentTerm, rf.matchIndex[server], rf.commitIndex, rf.log[].Term)
-				if rf.commitIndex < rf.matchIndex[server] && rf.log[rf.matchIndex[server]].Term == rf.currentTerm {
-					totalPeers := len(rf.peers)
-					updatedPeers := 0
-					maxCommitableIndex := rf.commitIndex
-					for i := rf.commitIndex; i <= rf.matchIndex[server]; i++ {
-						updatedPeers = 0
-						for peer := range rf.peers {
-							if rf.me == peer {
-								updatedPeers++
-							}
-							if rf.matchIndex[peer] >= i {
-								updatedPeers++
-							}
-						}
-						if updatedPeers > totalPeers/2 {
-							// majority has updated logs
-							DLogF(dLog, dDebug, rf.me, "Log has majority, can commit {term:%d, index:%d}", rf.currentTerm, i)
-							maxCommitableIndex = i
-						}
-					}
-					rf.mu.Lock()
-					rf.commitIndex = maxCommitableIndex
-					rf.mu.Unlock()
-					go rf.applyLog()
-				}
-
-			}
-		}(server)
+		go rf.sendAppendEntryToPeer(server, peerArgs, &AppendEntriesReply{})
 	}
 }
 
 func (rf *Raft) applyLog() {
 	rf.mu.Lock()
-	DLogF(dCommit, dDebug, rf.me, "ApplyState:{lastApplied=%d, commit=%d}", rf.lastApplied, rf.commitIndex)
+	DLogF(dCommit, dDebug, rf.me, "ApplyState:{lastApplied=%d, commit=%d, log:%v}", rf.lastApplied, rf.commitIndex, rf.log)
 	for rf.commitIndex > rf.lastApplied {
 		DLogF(dApplyMsg, dDebug, rf.me, "Applying msg %d", rf.lastApplied+1)
 		rf.lastApplied++
 		rf.applyChannel <- ApplyMsg{
 			CommandValid: true,
-			Command:      rf.log[rf.lastApplied].Command,
+			Command:      rf.log[rf.lastApplied-1].Command,
 			CommandIndex: rf.lastApplied,
 		}
 	}
@@ -503,12 +529,13 @@ func (rf *Raft) setLeaderState() {
 }
 
 func (rf *Raft) initializeNextAndMatch() {
+	nextIndex := rf.GetLastLogIndex() + 1
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
 		}
 		rf.matchIndex[i] = 0
-		rf.nextIndex[i] = rf.GetLastLogIndex()
+		rf.nextIndex[i] = nextIndex
 	}
 }
 
@@ -572,6 +599,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.mu.Lock()
 		entry := LogEntry{Command: command, Term: term, Index: rf.GetLastLogIndex() + 1}
 		rf.log = append(rf.log, entry)
+		DLogF(dApplyMsg, dDebug, rf.me, "Command Appended %v %v", command, rf.log)
 		index = rf.GetLastLogIndex()
 		rf.mu.Unlock()
 		go rf.broadcastLogEntries()
@@ -638,7 +666,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.matchIndex = make([]int, len(rf.peers))
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.applyChannel = applyCh
-
+	rf.lastApplied = 0
+	rf.commitIndex = 0
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash

@@ -41,6 +41,10 @@ type AppendEntriesReply struct {
 	LastLogIndex  int
 }
 
+func (ar *AppendEntriesReply) String() string {
+	return fmt.Sprintf("{Term:%d,Success:%v,ConflictIndex:%d,PeerId:%d,LastLogIndex:%d}", ar.Term, ar.Success, ar.ConflictIndex, ar.PeerId, ar.LastLogIndex)
+}
+
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
