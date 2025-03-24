@@ -50,6 +50,9 @@ func DLogF(topic logTopic, logLevel logLevel, peerId int, format string, a ...in
 	if logLevel == dInfo && debugVerbosity < 1 {
 		return
 	}
+	if logLevel == dError && debugVerbosity < 0 {
+		return
+	}
 
 	time := time.Since(DebugStart).Milliseconds()
 	time /= 100
