@@ -105,4 +105,5 @@ const (
 	dTimer    logTopic = "TIMR"
 	dLog      logTopic = "LOG"
 	dApplyMsg logTopic = "APMC"
+	dTester   logTopic = "TEST"
 )

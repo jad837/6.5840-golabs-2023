@@ -300,10 +300,9 @@ func (rf *Raft) conductElection() {
 	rf.mu.Lock()
 	if rf.state != Leader {
 		rf.ResetElectionTime()
-
 		rf.setCandidateState()
-		myTerm := rf.currentTerm
 
+		myTerm := rf.currentTerm
 		args := &RequestVoteArgs{
 			Term:        myTerm,
 			CandidateId: rf.me,
@@ -389,9 +388,7 @@ func (rf *Raft) sendAppendEntryToPeer(server int, args *AppendEntriesArgs) {
 	prevLogTerm := 0
 	entries := make([]LogEntry, 0)
 	entries = append(entries, rf.log...)
-	DLogF(dLog, dTrace, rf.me, "Sending logs %v", entries)
 	if prevLogIndex != 0 {
-		DLogF(dLog, dDebug, rf.me, "PrevLogIndex is %d", prevLogIndex)
 		prevLogTerm = rf.log[prevLogIndex].Term
 		//Handling of these log indexes to manage the actual thing..
 		entries = rf.log[peerNextIndex-1:]
@@ -405,55 +402,70 @@ func (rf *Raft) sendAppendEntryToPeer(server int, args *AppendEntriesArgs) {
 		PrevLogTerm:  prevLogTerm,
 		Entries:      entries,
 	}
-	DLogF(dLog, dDebug, rf.me, "AppendEntriesArgs:%v", peerArgs)
+	// DLogF(dLog, dDebug, rf.me, "AppendEntriesArgs:%v", peerArgs)
 	if len(peerArgs.Entries) == 0 {
 		DLogF(dLog, dDebug, rf.me, "No log broadcasting to peer %d", server)
+		return
 	}
 
 	ok := rf.sendAppendEntries(server, peerArgs, reply)
 	reply.PeerId = server
 	if !ok {
-		DLogF(dLog, dError, rf.me, "Critical AppendEntries failed to peer %d", server)
-		reply.Success = false
-		reply.ConflictIndex = args.PrevLogIndex
-		reply.Term = args.Term
-		reply.LastLogIndex = args.PrevLogIndex
-		reply.PeerId = server
+		DLogF(dLog, dDebug, rf.me, "Critical AppendEntries failed to peer %d", server)
+		return
 	}
 	rf.mu.Lock()
-	if reply.ConflictIndex != -1 {
+
+	if reply.Term != rf.currentTerm {
+		if reply.Term > rf.currentTerm {
+			// bigger than me means that its a leader as well
+			DLogF(dLog, dTrace, rf.me, "Bigger term, big boss leader found maybe myTerm:%d hisTerm:%d", rf.currentTerm, reply.Term)
+			rf.setFollowerState(reply.Term, -1)
+		} else {
+			// only for logging
+			DLogF(dLog, dTrace, rf.me, "Term mismatch maybe old logging reply")
+		}
+		rf.mu.Unlock()
+		return
+	}
+	if reply.Success {
+		rf.nextIndex[reply.PeerId] = reply.LastLogIndex + 1
+		rf.matchIndex[reply.PeerId] = reply.LastLogIndex
+		rf.mu.Unlock()
+	} else {
 		DLogF(dLog, dDebug, rf.me, "ConflictIndex found %d", reply.ConflictIndex)
 		rf.nextIndex[reply.PeerId] = reply.ConflictIndex
 		rf.matchIndex[reply.PeerId] = max(0, reply.ConflictIndex-1)
-	} else {
-		rf.nextIndex[reply.PeerId] = reply.LastLogIndex + 1
-		rf.matchIndex[reply.PeerId] = reply.LastLogIndex
+		rf.mu.Unlock()
 	}
-	rf.mu.Unlock()
 	if reply.Success {
-		DLogF(dLog, dDebug, rf.me, "Successful log entry to peer, reply.LastLogIndex %d", reply.LastLogIndex)
-		DLogF(dLog, dDebug, rf.me, "Updated for peer %d, {matchIndex:%d, nextIndex:%d}", server, rf.matchIndex[server], rf.nextIndex[server])
 		DLogF(dLog, dDebug, rf.me, "Log majority check {term:%d, index:%d, commitIndex:%d, logTerm:%d}", rf.currentTerm, rf.matchIndex[server], rf.commitIndex, rf.log[len(rf.log)-1].Term)
 		if rf.commitIndex < rf.matchIndex[server] && rf.log[rf.matchIndex[server]-1].Term == rf.currentTerm {
 			totalPeers := len(rf.peers)
-			updatedPeers := 0
-			maxCommitableIndex := rf.commitIndex
-			for i := rf.commitIndex; i <= rf.matchIndex[server]; i++ {
-				updatedPeers = 0
+			for i := rf.commitIndex + 1; i <= rf.matchIndex[server]; i++ {
+				DLogF(dLog, dTrace, rf.me, "Check update of CI for commitIndex:%d, server: %d", i, server)
+				updatedPeers := 1
 				for peer := range rf.peers {
-					if rf.me == peer || rf.matchIndex[peer] >= i {
+					if peer == rf.me {
+						continue
+					}
+					if rf.matchIndex[peer] >= i {
+						DLogF(dLog, dTrace, rf.me, "Matching check for peer:%d, index:%d", peer, i)
 						updatedPeers++
 					}
+					DLogF(dLog, dTrace, rf.me, "Peer test {peer:%d, totalPeers:%d, updatedPeers:%d, matchIndex:%v}", peer, totalPeers, updatedPeers, rf.matchIndex)
 				}
 				if updatedPeers > totalPeers/2 {
 					// majority has updated logs
-					DLogF(dLog, dDebug, rf.me, "Log has majority, can commit {term:%d, index:%d}", rf.currentTerm, i)
-					maxCommitableIndex = i
+					DLogF(dLog, dDebug, rf.me, "Log has majority, can commit {updatedPeers:%d, term:%d, index:%d}", updatedPeers, rf.currentTerm, i)
+					rf.mu.Lock()
+					rf.commitIndex = i
+					rf.mu.Unlock()
+				} else {
+					DLogF(dLog, dDebug, rf.me, "Log minor, cant commit {updatedPeers:%d, term:%d, index:%d}", updatedPeers, rf.currentTerm, i)
+					break
 				}
 			}
-			rf.mu.Lock()
-			rf.commitIndex = maxCommitableIndex
-			rf.mu.Unlock()
 			go rf.applyLog()
 		}
 
@@ -514,9 +526,20 @@ func (rf *Raft) broadcastHeartbeat() {
 		if server == rf.me {
 			continue
 		}
+		rf.mu.Lock()
+		args.PrevLogIndex = rf.GetLastLogIndex()
+		args.PrevLogTerm = rf.GetLastLogTerm()
+		rf.mu.Unlock()
 		go func(server int) {
 			reply := AppendEntriesReply{}
-			rf.sendAppendEntries(server, args, &reply)
+			ok := rf.sendAppendEntries(server, args, &reply)
+			rf.mu.Lock()
+			if ok && reply.Term != rf.currentTerm {
+				if reply.Term > rf.currentTerm {
+					rf.setFollowerState(reply.Term, -1)
+				}
+			}
+			rf.mu.Unlock()
 		}(server)
 	}
 }
@@ -595,11 +618,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	term, isLeader = rf.GetState()
 	// Your code here (2B).
 	if isLeader {
-		DLogF(dApplyMsg, dTrace, rf.me, "Command Received %v %v", command, len(rf.log))
 		rf.mu.Lock()
 		entry := LogEntry{Command: command, Term: term, Index: rf.GetLastLogIndex() + 1}
 		rf.log = append(rf.log, entry)
-		DLogF(dApplyMsg, dTrace, rf.me, "Command Appended %v %v", command, rf.log)
 		DLogF(dApplyMsg, dDebug, rf.me, "Command Appended at Index %v", rf.GetLastLogIndex())
 
 		index = rf.GetLastLogIndex()
