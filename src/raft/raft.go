@@ -256,9 +256,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		}
 	}
 
-	if args.PrevLogIndex != 0 && args.PrevLogIndex < rf.GetLastLogIndex() {
+	if args.PrevLogIndex < rf.GetLastLogIndex() {
 		DLogF(dLog, dDebug, rf.me, "Removing conflicting entries {prevLogIndex: %d, lastLogIndex:%d}", args.PrevLogIndex, rf.GetLastLogIndex())
-		rf.log = rf.log[:args.PrevLogIndex+1]
+		rf.log = rf.log[:args.PrevLogIndex]
 	}
 
 	//appended new entries
