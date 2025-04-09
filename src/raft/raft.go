@@ -75,8 +75,9 @@ type Raft struct {
 	matchIndex []int
 
 	// timers
-	electionTimer   *time.Timer
-	heartbeatTicker *time.Ticker
+	electionTimer     *time.Timer
+	heartbeatTicker   *time.Ticker
+	commitIndexTicker *time.Ticker
 
 	applyChannel chan ApplyMsg
 }
@@ -179,12 +180,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 }
 
 func getRandomizedElectionTimer() time.Duration {
-	ms := time.Duration(250 + rand.Int()%100)
+	ms := time.Duration(400 + rand.Int()%100)
 	return time.Duration(ms * time.Millisecond)
 }
 
 func getHeartbeattimer() time.Duration {
-	return time.Duration(100 * time.Millisecond)
+	return time.Duration(200 * time.Millisecond)
 }
 
 func (rf *Raft) ResetElectionTime() {
@@ -204,28 +205,15 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	reply.Term = args.Term
 	if args.Term > rf.currentTerm {
 		// I am lagging as leader so I should abandone being leader
 		DLogF(dLog, dDebug, rf.me, "New leader found, leader=%d, term=%d", args.LeaderId, args.Term)
-		rf.currentTerm = args.Term
-		rf.votedFor = -1
+		rf.setFollowerState(args.Term, -1)
 	}
-	rf.commitIndex = min(rf.GetLastLogIndex(), args.LeaderCommit)
-	rf.state = Follower
 
-	if len(args.Entries) == 0 {
-		// empty log Heartbeat
-		DLogF(dHtbt, dDebug, rf.me, "Received from=%d", args.LeaderId)
-		reply.Term = rf.currentTerm
-		reply.Success = true
-		reply.LastLogIndex = rf.GetLastLogIndex()
-		reply.ConflictIndex = -1
-		reply.PeerId = rf.me
-		rf.ResetElectionTime()
-		go rf.applyLog()
-		return
-	}
+	rf.ResetElectionTime()
+	reply.Term = rf.currentTerm
+
 	/*
 		// if my GetLastLogIndex = 0 when no logs are there.
 		if this is anything its painful because of how bad I have written this.
@@ -240,20 +228,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.ConflictIndex = rf.GetLastLogIndex()
 		return
 	}
-	if args.PrevLogIndex != 0 && args.PrevLogIndex <= rf.GetLastLogIndex() {
+
+	if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
 		// now I can match the index and term
-		DLogF(dLog, dDebug, rf.me, "Checking log mismatch")
-		if rf.log[args.PrevLogIndex-1].Term != rf.log[rf.GetLastLogIndex()-1].Term {
-			conflictIndex := args.PrevLogIndex
-			conflictTerm := rf.log[conflictIndex].Term
-			for conflictIndex > 0 && rf.log[conflictIndex].Term == conflictTerm {
-				conflictIndex--
-			}
-			DLogF(dLog, dDebug, rf.me, "MismatchIndex: %d, MismatchTerm: %d", conflictIndex, conflictTerm)
-			reply.Success = false
-			reply.ConflictIndex = conflictIndex
-			return
+		// DLogF(dLog, dTrace, rf.me, "Checking log mismatch")
+		conflictIndex := args.PrevLogIndex
+		conflictTerm := rf.log[conflictIndex].Term
+		for conflictIndex > 0 && rf.log[conflictIndex].Term == conflictTerm {
+			conflictIndex--
 		}
+		DLogF(dLog, dDebug, rf.me, "MismatchIndex: %d, MismatchTerm: %d", conflictIndex, conflictTerm)
+		reply.Success = false
+		reply.ConflictIndex = conflictIndex
+		return
 	}
 
 	if args.PrevLogIndex < rf.GetLastLogIndex() {
@@ -261,10 +248,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		rf.log = rf.log[:args.PrevLogIndex]
 	}
 
+	DLogF(dLog, dDebug, rf.me, "Entries added %v", len(args.Entries))
+
 	//appended new entries
 	rf.log = append(rf.log, args.Entries...)
-	DLogF(dLog, dDebug, rf.me, "Entries added %v", rf.log)
-	rf.commitIndex = min(rf.commitIndex, min(args.LeaderCommit, rf.GetLastLogIndex()))
+	rf.commitIndex = min(args.LeaderCommit, rf.GetLastLogIndex())
 	reply.Success = true
 	reply.ConflictIndex = -1
 	reply.Term = rf.currentTerm
@@ -368,7 +356,7 @@ func (rf *Raft) conductElection() {
 			DLogF(dElec, dTrace, rf.me, "Leader state after winning commitIndex:%d, term:%d, lastApplied:%d", rf.commitIndex, rf.currentTerm, rf.lastApplied)
 			DLogF(dElec, dTrace, rf.me, "Leader Logs after winning %v", rf.log)
 			rf.ResetElectionTime()
-			go rf.broadcastHeartbeat()
+			go rf.broadcastLogEntries()
 			return
 		} else {
 			DLogF(dElec, dDebug, rf.me, "Election lost...state=%v,votesG=%d", rf.state, votesGranted)
@@ -389,7 +377,9 @@ func (rf *Raft) sendAppendEntryToPeer(server int, args *AppendEntriesArgs) {
 	entries := make([]LogEntry, 0)
 	entries = append(entries, rf.log...)
 	if prevLogIndex != 0 {
-		prevLogTerm = rf.log[prevLogIndex].Term
+		DLogF(dLog, dDebug, rf.me, "Log Entries issues %v", rf.log)
+		DLogF(dLog, dDebug, rf.me, "Indexes :%d, %d, %d", peerNextIndex, prevLogIndex, prevLogTerm)
+		prevLogTerm = rf.log[prevLogIndex-1].Term
 		//Handling of these log indexes to manage the actual thing..
 		entries = rf.log[peerNextIndex-1:]
 	}
@@ -401,11 +391,6 @@ func (rf *Raft) sendAppendEntryToPeer(server int, args *AppendEntriesArgs) {
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  prevLogTerm,
 		Entries:      entries,
-	}
-	// DLogF(dLog, dDebug, rf.me, "AppendEntriesArgs:%v", peerArgs)
-	if len(peerArgs.Entries) == 0 {
-		DLogF(dLog, dDebug, rf.me, "No log broadcasting to peer %d", server)
-		return
 	}
 
 	ok := rf.sendAppendEntries(server, peerArgs, reply)
@@ -438,43 +423,35 @@ func (rf *Raft) sendAppendEntryToPeer(server int, args *AppendEntriesArgs) {
 		rf.matchIndex[reply.PeerId] = max(0, reply.ConflictIndex-1)
 		rf.mu.Unlock()
 	}
-	if reply.Success {
-		DLogF(dLog, dDebug, rf.me, "Log majority check {term:%d, index:%d, commitIndex:%d, logTerm:%d}", rf.currentTerm, rf.matchIndex[server], rf.commitIndex, rf.log[len(rf.log)-1].Term)
-		if rf.commitIndex < rf.matchIndex[server] && rf.log[rf.matchIndex[server]-1].Term == rf.currentTerm {
-			totalPeers := len(rf.peers)
-			for i := rf.commitIndex + 1; i <= rf.matchIndex[server]; i++ {
-				DLogF(dLog, dTrace, rf.me, "Check update of CI for commitIndex:%d, server: %d", i, server)
-				updatedPeers := 1
-				for peer := range rf.peers {
-					if peer == rf.me {
-						continue
-					}
-					if rf.matchIndex[peer] >= i {
-						DLogF(dLog, dTrace, rf.me, "Matching check for peer:%d, index:%d", peer, i)
-						updatedPeers++
-					}
-					DLogF(dLog, dTrace, rf.me, "Peer test {peer:%d, totalPeers:%d, updatedPeers:%d, matchIndex:%v}", peer, totalPeers, updatedPeers, rf.matchIndex)
-				}
-				if updatedPeers > totalPeers/2 {
-					// majority has updated logs
-					DLogF(dLog, dDebug, rf.me, "Log has majority, can commit {updatedPeers:%d, term:%d, index:%d}", updatedPeers, rf.currentTerm, i)
-					rf.mu.Lock()
-					rf.commitIndex = i
-					rf.mu.Unlock()
-				} else {
-					DLogF(dLog, dDebug, rf.me, "Log minor, cant commit {updatedPeers:%d, term:%d, index:%d}", updatedPeers, rf.currentTerm, i)
-					break
-				}
-			}
-			go rf.applyLog()
-		}
+}
 
-	} else {
-		DLogF(dLog, dError, rf.me, "AppendEntries.Reply.Failed %v", reply)
-		//retry
-		go rf.sendAppendEntryToPeer(server, args)
-
+// should only be used when its a leader
+func (rf *Raft) monitorCommitIndex() {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	nextCommitIndex := rf.commitIndex + 1
+	for !rf.killed() && rf.state == Leader && nextCommitIndex <= rf.GetLastLogIndex() && rf.logIndexCopiedAcrossPeers(nextCommitIndex) {
+		DLogF(dCommit, dTrace, rf.me, "Update commit index: {oldIndex:%d, newIndex:%d}", rf.commitIndex, rf.commitIndex+1)
+		rf.commitIndex++
+		nextCommitIndex++
 	}
+	go rf.applyLog()
+}
+
+func (rf *Raft) logIndexCopiedAcrossPeers(index int) bool {
+	updatedPeers := 1.0
+	totalPeers := len(rf.peers)
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		if rf.matchIndex[peer] >= index {
+			updatedPeers++
+		}
+		DLogF(dLog, dTrace, rf.me, "Peer test {peer:%d, totalPeers:%d, updatedPeers:%f, matchIndex:%v}", peer, totalPeers, updatedPeers, rf.matchIndex)
+	}
+	DLogF(dApplyMsg, dDebug, rf.me, "Peers updated with commitIndex:%d => %v, can apply msg %v", index, updatedPeers, (updatedPeers / float64(totalPeers) / 2))
+	return updatedPeers > float64(totalPeers)/2
 }
 
 func (rf *Raft) broadcastLogEntries() {
@@ -498,8 +475,8 @@ func (rf *Raft) broadcastLogEntries() {
 
 func (rf *Raft) applyLog() {
 	rf.mu.Lock()
-	DLogF(dCommit, dDebug, rf.me, "ApplyState:{lastApplied=%d, commit=%d}", rf.lastApplied, rf.commitIndex)
 	for rf.commitIndex > rf.lastApplied {
+		DLogF(dCommit, dDebug, rf.me, "ApplyState:{lastApplied=%d, commit=%d}", rf.lastApplied, rf.commitIndex)
 		DLogF(dApplyMsg, dDebug, rf.me, "Applying msg %d", rf.lastApplied+1)
 		rf.lastApplied++
 		rf.applyChannel <- ApplyMsg{
@@ -509,39 +486,6 @@ func (rf *Raft) applyLog() {
 		}
 	}
 	rf.mu.Unlock()
-}
-
-func (rf *Raft) broadcastHeartbeat() {
-	rf.mu.Lock()
-	logs := make([]LogEntry, 0)
-	args := &AppendEntriesArgs{
-		Term:         rf.currentTerm,
-		LeaderId:     rf.me,
-		Entries:      logs,
-		LeaderCommit: rf.commitIndex,
-	}
-	rf.mu.Unlock()
-	DLogF(dHtbt, dDebug, rf.me, "Sent htbt")
-	for server := range rf.peers {
-		if server == rf.me {
-			continue
-		}
-		rf.mu.Lock()
-		args.PrevLogIndex = rf.GetLastLogIndex()
-		args.PrevLogTerm = rf.GetLastLogTerm()
-		rf.mu.Unlock()
-		go func(server int) {
-			reply := AppendEntriesReply{}
-			ok := rf.sendAppendEntries(server, args, &reply)
-			rf.mu.Lock()
-			if ok && reply.Term != rf.currentTerm {
-				if reply.Term > rf.currentTerm {
-					rf.setFollowerState(reply.Term, -1)
-				}
-			}
-			rf.mu.Unlock()
-		}(server)
-	}
 }
 
 func (rf *Raft) setLeaderState() {
@@ -660,9 +604,11 @@ func (rf *Raft) ticker() {
 		case <-rf.heartbeatTicker.C:
 			rf.mu.Lock()
 			if rf.state == Leader {
-				go rf.broadcastHeartbeat()
+				go rf.broadcastLogEntries()
 			}
 			rf.mu.Unlock()
+		case <-rf.commitIndexTicker.C:
+			go rf.monitorCommitIndex()
 		}
 	}
 }
@@ -684,6 +630,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 	rf.heartbeatTicker = time.NewTicker(getHeartbeattimer())
 	rf.electionTimer = time.NewTimer(getRandomizedElectionTimer())
+	rf.commitIndexTicker = time.NewTicker(time.Duration(300) * time.Millisecond)
 	rf.setFollowerState(1, -1)
 	rf.log = make([]LogEntry, 0)
 	rf.matchIndex = make([]int, len(rf.peers))
