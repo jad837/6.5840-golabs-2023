@@ -19,9 +19,30 @@ type AppendEntriesArgs struct {
 	LeaderCommit int
 }
 
+func (ae *AppendEntriesArgs) String() string {
+	entriesStr := "["
+	for i, entry := range ae.Entries {
+		entriesStr += entry.String()
+		if i < len(ae.Entries)-1 {
+			entriesStr += ", "
+		}
+	}
+	entriesStr += "]"
+
+	return fmt.Sprintf("{Term: %d, LeaderId: %d, PrevLogIndex: %d, PrevLogTerm: %d, Entries: %s, LeaderCommit: %d}",
+		ae.Term, ae.LeaderId, ae.PrevLogIndex, ae.PrevLogTerm, entriesStr, ae.LeaderCommit)
+}
+
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term          int
+	Success       bool
+	ConflictIndex int
+	PeerId        int
+	LastLogIndex  int
+}
+
+func (ar *AppendEntriesReply) String() string {
+	return fmt.Sprintf("{Term:%d,Success:%v,ConflictIndex:%d,PeerId:%d,LastLogIndex:%d}", ar.Term, ar.Success, ar.ConflictIndex, ar.PeerId, ar.LastLogIndex)
 }
 
 // example RequestVote RPC arguments structure.
@@ -49,6 +70,11 @@ func (reply *RequestVoteReply) String() string {
 type LogEntry struct {
 	Command interface{}
 	Term    int
+	Index   int
+}
+
+func (le *LogEntry) String() string {
+	return fmt.Sprintf("{Term: %d, Command: %+v, Index:%d}", le.Term, le.Command, le.Index)
 }
 
 const (
@@ -79,4 +105,5 @@ const (
 	dTimer    logTopic = "TIMR"
 	dLog      logTopic = "LOG"
 	dApplyMsg logTopic = "APMC"
+	dTester   logTopic = "TEST"
 )
