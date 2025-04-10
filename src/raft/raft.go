@@ -232,7 +232,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
 		// now I can match the index and term
 		// DLogF(dLog, dTrace, rf.me, "Checking log mismatch")
-		conflictIndex := args.PrevLogIndex
+		conflictIndex := args.PrevLogIndex - 1
 		conflictTerm := rf.log[conflictIndex].Term
 		for conflictIndex > 0 && rf.log[conflictIndex].Term == conflictTerm {
 			conflictIndex--
@@ -377,11 +377,11 @@ func (rf *Raft) sendAppendEntryToPeer(server int, args *AppendEntriesArgs) {
 	entries := make([]LogEntry, 0)
 	entries = append(entries, rf.log...)
 	if prevLogIndex != 0 {
-		DLogF(dLog, dDebug, rf.me, "Log Entries issues %v", rf.log)
-		DLogF(dLog, dDebug, rf.me, "Indexes :%d, %d, %d", peerNextIndex, prevLogIndex, prevLogTerm)
 		prevLogTerm = rf.log[prevLogIndex-1].Term
 		//Handling of these log indexes to manage the actual thing..
 		entries = rf.log[peerNextIndex-1:]
+		DLogF(dLog, dDebug, rf.me, "Entries exchange: entries:%v peerNextIndex:%d, prevLogIndex:%d, prevLogTerm%d", entries, peerNextIndex, prevLogIndex, prevLogTerm)
+
 	}
 	rf.mu.Unlock()
 	peerArgs := &AppendEntriesArgs{
