@@ -134,8 +134,6 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.votedFor = votedFor
 		rf.log = log
 	}
-	rf.commitIndex = rf.GetLastLogIndex()
-	rf.lastApplied = rf.GetLastLogIndex()
 }
 
 // the service says it has created a snapshot that has
