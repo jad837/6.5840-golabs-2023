@@ -63,6 +63,20 @@ type RequestVoteReply struct {
 	VoteGranted bool
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Offset            int
+	Data              []byte
+	Done              bool
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 func (reply *RequestVoteReply) String() string {
 	return fmt.Sprintf("RequestVoteReply{Term: %d, VoteGranted: %t}", reply.Term, reply.VoteGranted)
 }

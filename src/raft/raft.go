@@ -80,6 +80,11 @@ type Raft struct {
 	commitIndexTicker *time.Ticker
 
 	applyChannel chan ApplyMsg
+
+	snapshotIndexOffset int
+	lastSnapshotIndex   int
+	snapshot            []byte
+	lastSnapshotTerm    int
 }
 
 // return currentTerm and whether this server
@@ -142,7 +147,56 @@ func (rf *Raft) readPersist(data []byte) {
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if index <= rf.snapshotIndexOffset {
+		return
+	}
+	defer rf.persist()
+	snapshotLastEntry := rf.log[index-rf.snapshotIndexOffset-1]
+
+	rf.snapshot = snapshot
+	rf.lastSnapshotIndex = snapshotLastEntry.Index
+	rf.lastSnapshotTerm = snapshotLastEntry.Term
+
+	rf.log = rf.log[index-rf.snapshotIndexOffset:]
+	rf.snapshotIndexOffset = index
+
+}
+
+func (rf *Raft) InstallSnapshot() (args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if args.Term < rf.currentTerm {
+		DLogF(dSnap, dDebug, rf.me, "Rejecting InstallSnapshot as term is lower %d < %d", args.Term, rf.currentTerm)
+		reply.Term = rf.currentTerm
+		return
+	}
+	if args.LastIncludedIndex <= rf.lastSnapshotIndex {
+		DLogF(dSnap, dDebug, rf.me, "Rejecting InstallSnapshot as last included index is lower %d <= %d", args.LastIncludedIndex, rf.lastSnapshotIndex)
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	rf.snapshotIndexOffset = args.LastIncludedIndex
+	rf.snapshot = args.Data
+	rf.lastSnapshotIndex = args.LastIncludedIndex
+	rf.lastSnapshotTerm = args.LastIncludedTerm
+	rf.commitIndex = rf.snapshotIndexOffset
+	rf.lastApplied = rf.snapshotIndexOffset
+	rf.log = nil
+	rf.persist()
+	applyMsg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      rf.snapshot,
+		SnapshotTerm:  rf.lastSnapshotTerm,
+		SnapshotIndex: rf.lastSnapshotIndex,
+	}
+	rf.applyChannel <- applyMsg
+	reply.Term = rf.currentTerm
+	DLogF(dSnap, dDebug, rf.me, "InstallSnapshot applied: lastSnapshotIndex=%d, lastSnapshotTerm=%d, snapshotSize=%d", rf.lastSnapshotIndex, rf.lastSnapshotTerm, len(rf.snapshot))
+	return
 }
 
 func (rf *Raft) setFollowerState(term int, votedFor int) {
