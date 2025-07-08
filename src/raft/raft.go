@@ -112,8 +112,11 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
+	e.Encode(rf.snapshotIndexOffset)
+	e.Encode(rf.lastSnapshotIndex)
+	e.Encode(rf.lastSnapshotTerm)
 	data := w.Bytes()
-	rf.persister.Save(data, nil)
+	rf.persister.Save(data, rf.snapshot)
 }
 
 // restore previously persisted state.
@@ -129,16 +132,29 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
+	var snapshotIndexOffset int
+	var snapshotLastIndex int
+	var snapshotLastTerm int
 	if decoder.Decode(&currentTerm) != nil ||
 		decoder.Decode(&votedFor) != nil ||
-		decoder.Decode(&log) != nil {
+		decoder.Decode(&log) != nil ||
+		decoder.Decode(&snapshotIndexOffset) != nil ||
+		decoder.Decode(&snapshotLastIndex) != nil ||
+		decoder.Decode(&snapshotLastTerm) != nil {
 		DLogF(dPersist, dError, rf.me, "Error decoding persisted state")
 	} else {
 		DLogF(dPersist, dDebug, rf.me, "Restored persisted state: currentTerm=%d, votedFor=%d, log=%v", currentTerm, votedFor, log)
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.snapshotIndexOffset = snapshotIndexOffset
+		rf.lastSnapshotIndex = snapshotLastIndex
+		rf.lastSnapshotTerm = snapshotLastTerm
+		rf.commitIndex = rf.snapshotIndexOffset
+		rf.lastApplied = rf.snapshotIndexOffset
 	}
+	rf.snapshot = rf.persister.ReadSnapshot()
+
 }
 
 // the service says it has created a snapshot that has
@@ -290,7 +306,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		return
 	}
 
-	if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
+	if args.PrevLogIndex > rf.lastSnapshotIndex && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
 		// now I can match the index and term
 		// DLogF(dLog, dTrace, rf.me, "Checking log mismatch")
 		conflictIndex := args.PrevLogIndex - 1
@@ -327,14 +343,14 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) GetLastLogTerm() int {
 	if len(rf.log) == 0 {
-		return 0
+		return rf.lastSnapshotTerm
 	}
 	return rf.log[len(rf.log)-1].Term
 }
 
 func (rf *Raft) GetLastLogIndex() int {
 	if len(rf.log) == 0 {
-		return 0
+		return rf.lastSnapshotIndex
 	}
 	return rf.log[len(rf.log)-1].Index
 }
