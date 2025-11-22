@@ -66,6 +66,10 @@ type Raft struct {
 	votedFor    int
 	log         []LogEntry
 
+	// snapshot state
+	lastIncludedIndex int
+	lastIncludedTerm  int
+
 	//volatile
 	commitIndex int
 	lastApplied int
@@ -106,9 +110,11 @@ func (rf *Raft) persist() {
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
 	e.Encode(rf.log)
 	data := w.Bytes()
-	rf.persister.Save(data, nil)
+	rf.persister.Save(data, rf.persister.ReadSnapshot())
 }
 
 // restore previously persisted state.
@@ -124,15 +130,21 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
+	var lastIncludedIndex int
+	var lastIncludedTerm int
 	if decoder.Decode(&currentTerm) != nil ||
 		decoder.Decode(&votedFor) != nil ||
+		decoder.Decode(&lastIncludedIndex) != nil ||
+		decoder.Decode(&lastIncludedTerm) != nil ||
 		decoder.Decode(&log) != nil {
 		DLogF(dPersist, dError, rf.me, "Error decoding persisted state")
 	} else {
-		DLogF(dPersist, dDebug, rf.me, "Restored persisted state: currentTerm=%d, votedFor=%d, log=%v", currentTerm, votedFor, log)
+		DLogF(dPersist, dDebug, rf.me, "Restored persisted state: currentTerm=%d, votedFor=%d, log=%v, lastIncludedIndex=%d, lastIncludedTerm=%d", currentTerm, votedFor, log, lastIncludedIndex, lastIncludedTerm)
 		rf.currentTerm = currentTerm
 		rf.votedFor = votedFor
 		rf.log = log
+		rf.lastIncludedIndex = lastIncludedIndex
+		rf.lastIncludedTerm = lastIncludedTerm
 	}
 }
 
@@ -141,8 +153,109 @@ func (rf *Raft) readPersist(data []byte) {
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
-	// Your code here (2D).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if index <= rf.lastIncludedIndex || index > rf.commitIndex {
+		DLogF(dSnap, dWarn, rf.me, "Snapshot rejected: index=%d, lastIncludedIndex=%d, commitIndex=%d", index, rf.lastIncludedIndex, rf.commitIndex)
+		return
+	}
+
+	// Save the term of the last included entry
+	rf.lastIncludedTerm = rf.getLogEntry(index).Term
+
+	// Truncate the log
+	// Keep entries from index+1 onwards
+	newLog := make([]LogEntry, 0)
+	newLog = append(newLog, rf.log[rf.getLogSliceIndex(index)+1:]...)
+	rf.log = newLog
+
+	rf.lastIncludedIndex = index
+
+	DLogF(dSnap, dDebug, rf.me, "Snapshot applied: index=%d, term=%d, logLen=%d", rf.lastIncludedIndex, rf.lastIncludedTerm, len(rf.log))
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.Save(data, snapshot)
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm {
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.setFollowerState(args.Term, -1)
+	}
+	rf.ResetElectionTime()
+
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		return
+	}
+
+	// Check if we have the entry at LastIncludedIndex with the same term
+	// If so, we can retain the log from that point onwards
+	// Otherwise, we discard the entire log
+
+	// We need to be careful here. If our log contains the entry at args.LastIncludedIndex,
+	// and it matches args.LastIncludedTerm, then we keep the log after that.
+	// However, since our log is 0-indexed relative to lastIncludedIndex, we need to check
+	// if args.LastIncludedIndex is within our current log range.
+
+	hasEntry := false
+	if args.LastIncludedIndex <= rf.GetLastLogIndex() && args.LastIncludedIndex > rf.lastIncludedIndex {
+		entry := rf.getLogEntry(args.LastIncludedIndex)
+		if entry.Term == args.LastIncludedTerm {
+			hasEntry = true
+		}
+	}
+
+	if hasEntry {
+		// Retain log from args.LastIncludedIndex + 1
+		newLog := make([]LogEntry, 0)
+		newLog = append(newLog, rf.log[rf.getLogSliceIndex(args.LastIncludedIndex)+1:]...)
+		rf.log = newLog
+	} else {
+		// Discard entire log
+		rf.log = make([]LogEntry, 0)
+	}
+
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.lastIncludedTerm = args.LastIncludedTerm
+	rf.commitIndex = max(rf.commitIndex, rf.lastIncludedIndex)
+	rf.lastApplied = max(rf.lastApplied, rf.lastIncludedIndex)
+
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.lastIncludedIndex)
+	e.Encode(rf.lastIncludedTerm)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.Save(data, args.Data)
+
+	msg := ApplyMsg{
+		SnapshotValid: true,
+		Snapshot:      args.Data,
+		SnapshotTerm:  rf.lastIncludedTerm,
+		SnapshotIndex: rf.lastIncludedIndex,
+	}
+
+	go func() {
+		rf.applyChannel <- msg
+	}()
 }
 
 func (rf *Raft) setFollowerState(term int, votedFor int) {
@@ -167,7 +280,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		DLogF(dVote, dDebug, rf.me, "Higher term found, perhaps new leader leadterm=%d, myterm=%d", args.Term, rf.currentTerm)
 		rf.setFollowerState(args.Term, -1)
-		rf.ResetElectionTime()
 	}
 	reply.Term = rf.currentTerm
 	// what are the chances that election timeout goes out right in this patch? not many but still too many, thats why called resetElectionTimer
@@ -227,38 +339,74 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		if my PrevLogIndex = 1 then my GetLastLogIndex can be equal to 0
 		How do you solve this shit problem?
 	*/
+	if args.PrevLogIndex < rf.lastIncludedIndex {
+		reply.Success = false
+		reply.ConflictIndex = rf.lastIncludedIndex + 1
+		return
+	}
+
 	if args.PrevLogIndex > rf.GetLastLogIndex() {
 		// prevLogIndex is not included in my rf.log
 		// prevLogIndex is greater means my logIndex should be the lastLogIndex for this whole sham
 		DLogF(dLog, dDebug, rf.me, "PrevLogIndex is too high, conflict index will be my last log")
 		reply.Success = false
-		reply.ConflictIndex = rf.GetLastLogIndex()
+		reply.ConflictIndex = rf.GetLastLogIndex() + 1
 		return
 	}
 
-	if args.PrevLogIndex > 0 && rf.log[args.PrevLogIndex-1].Term != args.PrevLogTerm {
-		// now I can match the index and term
-		// DLogF(dLog, dTrace, rf.me, "Checking log mismatch")
-		conflictIndex := args.PrevLogIndex - 1
-		conflictTerm := rf.log[conflictIndex].Term
-		for conflictIndex > 0 && rf.log[conflictIndex].Term == conflictTerm {
-			conflictIndex--
+	if args.PrevLogIndex > rf.lastIncludedIndex {
+		term := rf.getLogEntry(args.PrevLogIndex).Term
+		if term != args.PrevLogTerm {
+			// now I can match the index and term
+			// DLogF(dLog, dTrace, rf.me, "Checking log mismatch")
+			conflictIndex := args.PrevLogIndex
+			conflictTerm := rf.getLogEntry(conflictIndex).Term
+			for conflictIndex > rf.lastIncludedIndex && rf.getLogEntry(conflictIndex).Term == conflictTerm {
+				conflictIndex--
+			}
+			DLogF(dLog, dDebug, rf.me, "MismatchIndex: %d, MismatchTerm: %d", conflictIndex, conflictTerm)
+			reply.Success = false
+			reply.ConflictIndex = conflictIndex + 1
+			return
 		}
-		DLogF(dLog, dDebug, rf.me, "MismatchIndex: %d, MismatchTerm: %d", conflictIndex, conflictTerm)
-		reply.Success = false
-		reply.ConflictIndex = conflictIndex
-		return
 	}
 
-	if args.PrevLogIndex < rf.GetLastLogIndex() {
-		DLogF(dLog, dDebug, rf.me, "Removing conflicting entries {prevLogIndex: %d, lastLogIndex:%d}", args.PrevLogIndex, rf.GetLastLogIndex())
-		rf.log = rf.log[:args.PrevLogIndex]
+	// If we are here, it means the log matches up to PrevLogIndex (or PrevLogIndex is lastIncludedIndex)
+	// We need to find the point where the new entries conflict with our existing log
+
+	logInsertIndex := args.PrevLogIndex + 1
+	newEntriesIndex := 0
+
+	for {
+		if logInsertIndex > rf.GetLastLogIndex() || newEntriesIndex >= len(args.Entries) {
+			break
+		}
+		if rf.getLogEntry(logInsertIndex).Term != args.Entries[newEntriesIndex].Term {
+			// Conflict found, truncate log
+			DLogF(dLog, dDebug, rf.me, "Removing conflicting entries {index: %d, lastLogIndex:%d}", logInsertIndex, rf.GetLastLogIndex())
+			// Truncate log from logInsertIndex
+			newLog := make([]LogEntry, 0)
+			// keep entries up to logInsertIndex - 1
+			// slice index for logInsertIndex is getLogSliceIndex(logInsertIndex)
+			// so we want up to that index
+			newLog = append(newLog, rf.log[:rf.getLogSliceIndex(logInsertIndex)]...)
+			rf.log = newLog
+			break
+		}
+		logInsertIndex++
+		newEntriesIndex++
+	}
+
+	// Append any remaining new entries
+	if newEntriesIndex < len(args.Entries) {
+		rf.log = append(rf.log, args.Entries[newEntriesIndex:]...)
 	}
 
 	DLogF(dLog, dDebug, rf.me, "Entries added %v", len(args.Entries))
 
 	//appended new entries
-	rf.log = append(rf.log, args.Entries...)
+	//appended new entries
+	// rf.log = append(rf.log, args.Entries...)
 	rf.commitIndex = min(args.LeaderCommit, rf.GetLastLogIndex())
 	rf.persist()
 	reply.Success = true
@@ -273,16 +421,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) GetLastLogTerm() int {
 	if len(rf.log) == 0 {
-		return 0
+		return rf.lastIncludedTerm
 	}
 	return rf.log[len(rf.log)-1].Term
 }
 
 func (rf *Raft) GetLastLogIndex() int {
 	if len(rf.log) == 0 {
-		return 0
+		return rf.lastIncludedIndex
 	}
 	return rf.log[len(rf.log)-1].Index
+}
+
+// getLogEntry returns the log entry at the given index.
+// It handles the offset caused by log compaction.
+func (rf *Raft) getLogEntry(index int) LogEntry {
+	return rf.log[rf.getLogSliceIndex(index)]
+}
+
+// getLogSliceIndex converts a logical log index to a slice index.
+func (rf *Raft) getLogSliceIndex(index int) int {
+	return index - rf.lastIncludedIndex - 1
 }
 
 func (rf *Raft) setCandidateState() {
@@ -377,20 +536,63 @@ func (rf *Raft) conductElection() {
 }
 
 func (rf *Raft) sendAppendEntryToPeer(server int, args *AppendEntriesArgs) {
-	reply := &AppendEntriesReply{}
 	rf.mu.Lock()
 	peerNextIndex := rf.nextIndex[server]
-	prevLogIndex := max(peerNextIndex-1, 0)
-	prevLogTerm := 0
-	entries := make([]LogEntry, 0)
-	entries = append(entries, rf.log...)
-	if prevLogIndex != 0 {
-		prevLogTerm = rf.log[prevLogIndex-1].Term
-		//Handling of these log indexes to manage the actual thing..
-		entries = rf.log[peerNextIndex-1:]
-		DLogF(dLog, dDebug, rf.me, "Entries exchange: entries:%v peerNextIndex:%d, prevLogIndex:%d, prevLogTerm:%d", entries, peerNextIndex, prevLogIndex, prevLogTerm)
+
+	// Check if we need to send a snapshot
+	if peerNextIndex <= rf.lastIncludedIndex {
+		// Send InstallSnapshot
+		snapshot := rf.persister.ReadSnapshot()
+		installArgs := &InstallSnapshotArgs{
+			Term:              rf.currentTerm,
+			LeaderId:          rf.me,
+			LastIncludedIndex: rf.lastIncludedIndex,
+			LastIncludedTerm:  rf.lastIncludedTerm,
+			Data:              snapshot,
+		}
+		rf.mu.Unlock()
+
+		reply := &InstallSnapshotReply{}
+		ok := rf.peers[server].Call("Raft.InstallSnapshot", installArgs, reply)
+
+		if !ok {
+			return
+		}
+
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.setFollowerState(reply.Term, -1)
+			rf.mu.Unlock()
+			return
+		}
+
+		if installArgs.Term != rf.currentTerm {
+			rf.mu.Unlock()
+			return
+		}
+
+		// Update nextIndex and matchIndex
+		rf.nextIndex[server] = max(rf.nextIndex[server], installArgs.LastIncludedIndex+1)
+		rf.matchIndex[server] = max(rf.matchIndex[server], installArgs.LastIncludedIndex)
+		rf.mu.Unlock()
+		return
 	}
+
+	prevLogIndex := peerNextIndex - 1
+	prevLogTerm := 0
+	if prevLogIndex == rf.lastIncludedIndex {
+		prevLogTerm = rf.lastIncludedTerm
+	} else {
+		prevLogTerm = rf.getLogEntry(prevLogIndex).Term
+	}
+
+	entries := make([]LogEntry, 0)
+	// entries starting from peerNextIndex
+	// slice index for peerNextIndex is getLogSliceIndex(peerNextIndex)
+	entries = append(entries, rf.log[rf.getLogSliceIndex(peerNextIndex):]...)
+
 	rf.mu.Unlock()
+
 	peerArgs := &AppendEntriesArgs{
 		LeaderId:     args.LeaderId,
 		Term:         args.Term,
@@ -400,6 +602,7 @@ func (rf *Raft) sendAppendEntryToPeer(server int, args *AppendEntriesArgs) {
 		Entries:      entries,
 	}
 
+	reply := &AppendEntriesReply{}
 	ok := rf.sendAppendEntries(server, peerArgs, reply)
 	reply.PeerId = server
 	if !ok {
@@ -421,13 +624,17 @@ func (rf *Raft) sendAppendEntryToPeer(server int, args *AppendEntriesArgs) {
 		return
 	}
 	if reply.Success {
-		rf.nextIndex[reply.PeerId] = reply.LastLogIndex + 1
-		rf.matchIndex[reply.PeerId] = reply.LastLogIndex
+		newMatchIndex := reply.LastLogIndex
+		if newMatchIndex > rf.GetLastLogIndex() {
+			newMatchIndex = rf.GetLastLogIndex()
+		}
+		rf.nextIndex[reply.PeerId] = newMatchIndex + 1
+		rf.matchIndex[reply.PeerId] = newMatchIndex
 		rf.mu.Unlock()
 	} else {
 		DLogF(dLog, dDebug, rf.me, "ConflictIndex found %d", reply.ConflictIndex)
 		rf.nextIndex[reply.PeerId] = reply.ConflictIndex
-		rf.matchIndex[reply.PeerId] = max(0, reply.ConflictIndex-1)
+		// rf.matchIndex[reply.PeerId] = max(0, reply.ConflictIndex-1)
 		rf.mu.Unlock()
 	}
 }
@@ -482,16 +689,22 @@ func (rf *Raft) broadcastLogEntries() {
 
 func (rf *Raft) applyLog() {
 	rf.mu.Lock()
+	var msgs []ApplyMsg
 	for rf.commitIndex > rf.lastApplied {
-		DLogF(dCommit, dDebug, rf.me, "ApplyState:{lastApplied=%d, commit=%d}", rf.lastApplied, rf.commitIndex)
 		rf.lastApplied++
-		rf.applyChannel <- ApplyMsg{
+		msg := ApplyMsg{
 			CommandValid: true,
-			Command:      rf.log[rf.lastApplied-1].Command,
+			Command:      rf.getLogEntry(rf.lastApplied).Command,
 			CommandIndex: rf.lastApplied,
 		}
+		msgs = append(msgs, msg)
+		DLogF(dCommit, dDebug, rf.me, "ApplyState:{lastApplied=%d, commit=%d}", rf.lastApplied, rf.commitIndex)
 	}
 	rf.mu.Unlock()
+
+	for _, msg := range msgs {
+		rf.applyChannel <- msg
+	}
 }
 
 func (rf *Raft) setLeaderState() {
@@ -649,6 +862,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+	rf.lastApplied = rf.lastIncludedIndex
+	rf.commitIndex = rf.lastIncludedIndex
 	// start ticker goroutine to start elections
 	go rf.ticker()
 

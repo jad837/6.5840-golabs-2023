@@ -67,6 +67,18 @@ func (reply *RequestVoteReply) String() string {
 	return fmt.Sprintf("RequestVoteReply{Term: %d, VoteGranted: %t}", reply.Term, reply.VoteGranted)
 }
 
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
 type LogEntry struct {
 	Command interface{}
 	Term    int
